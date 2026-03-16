@@ -293,6 +293,110 @@
 - `base_lm_step` 和 `residual_lm_step` 仍然有成本，但已经不是第一大头
 - `stop_predictor` 和 `locenc_patch_to_lm` 都不是关键瓶颈
 
+### 4.5 Decode：深入 `MiniCPM` 内层后的附加实验
+
+这轮在 runtime 级优化之外，又额外向 `MiniCPM` decode 内层做过一轮更激进的试验，目标是确认：
+
+- `base_lm_step`
+- `residual_lm_step`
+
+是否还能靠模型内部小改动继续明显下降。
+
+这些实验最后都**没有保留到主线**，因为它们要么数值不成立，要么虽然让局部 benchmark 变快，但让真实 `decode_step` 变慢。
+
+#### A. 直接复用 KV cache 全序列视图
+
+思路：
+
+- 让 attention 在 decode 时直接读取 cache-backed 的 `[0..total_len)` K/V 视图
+- 试图去掉每层一次：
+  - `permute`
+  - `concat`
+
+结果：
+
+- `test_voxcpm` trace 明确回归失败
+- 说明这条改法在当前图依赖和张量布局下不成立
+
+结论：
+
+- 这条路已经验证过，当前不能直接保留
+
+#### B. 用 `ggml_swiglu_split()` 替换 `silu(gate) * up`
+
+这轮重新做了一次严格串行验证：
+
+- `build`
+- `test_minicpm`
+- `test_voxcpm`
+- benchmark
+
+回归：
+
+- `test_minicpm` 通过
+- `test_voxcpm` 通过
+
+benchmark：
+
+- 来自：
+  - [benchmark/results/voxcpm_benchmark_20260316_205121.json](/home/orangepi/Codes/ggbond/VoxCPM.cpp/benchmark/results/voxcpm_benchmark_20260316_205121.json)
+- `decode.base_lm_step_fsq.early`：`65.297 ms`
+- `decode.residual_lm_step.early`：`66.858 ms`
+- `voxcpm.decode_step.early`：`649.859 ms`
+
+对比当前稳定 baseline：
+
+- `decode.base_lm_step_fsq.early`：约从 `84 ms` 降到 `65 ms`
+- `decode.residual_lm_step.early`：约从 `95 ms` 降到 `67 ms`
+- 但 `voxcpm.decode_step.early`：从 `528.694 ms` 升到 `649.859 ms`
+
+结论：
+
+- `swiglu` fused op 确实让 `MiniCPM` 局部 LM step 变快
+- 但它会让真实 `decode()` 主路径变慢
+- 因此这条路也已经回退
+
+#### C. `Q+K` 二合一投影
+
+思路：
+
+- 观察到当前模型里：
+  - `attn_q.weight`
+  - `attn_k.weight`
+- shape 对得上，且类型一致
+- 因此试图把 `Q/K` 两次投影收成一次大投影，再切回两个 view
+
+回归：
+
+- `test_minicpm` 通过
+- `test_voxcpm` 通过
+
+benchmark：
+
+- 来自：
+  - [benchmark/results/voxcpm_benchmark_20260316_204236.json](/home/orangepi/Codes/ggbond/VoxCPM.cpp/benchmark/results/voxcpm_benchmark_20260316_204236.json)
+  - [benchmark/results/voxcpm_benchmark_20260316_204508.json](/home/orangepi/Codes/ggbond/VoxCPM.cpp/benchmark/results/voxcpm_benchmark_20260316_204508.json)
+- `decode.base_lm_step_fsq.early`：约 `60 ms`
+- `decode.residual_lm_step.early`：约 `67 ~ 69 ms`
+- `voxcpm.decode_step.early`：约 `652 ~ 657 ms`
+
+结论：
+
+- 和 `swiglu` 情况非常像：
+  - 局部 `LM step` benchmark 变快
+  - 真实 `decode_step` 反而明显回退
+- 说明“把单个 `MiniCPM` 子图做快”并不自动等于“端到端 decode 更快”
+- 这条路同样已经回退
+
+总体判断：
+
+- `MiniCPM` decode 内层还存在可挖空间
+- 但当前已经排除了几条最自然、也最像低风险 patch 的路线
+- 后续如果继续，应直接进入：
+  - GGML 内核层
+  - 或更系统的端到端 phase breakdown
+- 而不是继续在 `src/minicpm.cpp` 里堆局部图替换
+
 ---
 
 ## 5. 重要解释
@@ -327,6 +431,39 @@
 
 在这些结构性问题没清理前，先上 scheduler 不是收益最高的一刀。
 
+### 5.3 为什么 `LM step` 局部 benchmark 变快了，真实 `decode_step` 反而变慢？
+
+这轮深入 `MiniCPM` 内层后，最重要的经验其实是：
+
+- `decode.base_lm_step_fsq`
+- `decode.residual_lm_step`
+
+并不能单独代表真实 `decode()` 主路径。
+
+我们已经实测到两类情况：
+
+- `swiglu` fused op
+- `Q+K` 二合一投影
+
+它们都会让这两个局部 case 下降，但同时让：
+
+- `voxcpm.decode_step.early`
+
+明显回退。
+
+这说明真实 decode 里还存在更大的共享成本，例如：
+
+- 图调度与同步
+- 额外张量布局转换
+- front-half / LM step 之间的交互开销
+- 或 GGML 在整图级别的线程/缓存行为
+
+因此后续判断 decode 优化是否“真的有效”，必须始终优先看：
+
+- `voxcpm.decode_step.early`
+
+局部子项 benchmark 只能作为辅助信号，不能单独作为保留优化的依据。
+
 ---
 
 ## 6. 当前结论
@@ -337,6 +474,7 @@
 2. `decode` 的主瓶颈已经明确集中在 front-half / `UnifiedCFM`
 3. decode 侧通过 runtime 结构优化已经拿到了约 `20%` 的真实单步收益
 4. 再往下继续抠 `LM step` 不是不行，但已经进入边际收益区
+5. `MiniCPM` 内层若继续优化，单看局部 `LM step` benchmark 已经不够，必须以真实 `decode_step` 为准
 
 ---
 
@@ -349,6 +487,7 @@
 1. 继续深挖 `LocEnc`
 2. 再考虑 `base_lm` prefill 路径
 3. decode 侧如继续做，则应下探 `MiniCPM/GGML` 内层算子，而不是继续加 runtime cache
+4. `src/minicpm.cpp` 层面的局部替换已试过多轮，优先级应低于 GGML 内核和更系统的 phase breakdown
 
 ### 7.2 如果目标是端到端 TTS 时延
 
@@ -380,5 +519,10 @@
 
 - `LocEnc` / `MiniCPM` 模型内部
 - 或 GGML 更底层的算子路径
+
+同时也要记住本轮补充得到的一个边界：
+
+- `MiniCPM` 局部 `LM step` 变快
+- 不代表真实 `decode_step` 一定变快
 
 这将是下一阶段的工作边界。
