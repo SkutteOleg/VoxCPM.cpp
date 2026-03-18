@@ -28,14 +28,30 @@ cmake --build build
 
 ### CUDA 构建
 
-在配置阶段启用 ggml 的 CUDA backend：
+只有当你打算使用 `--backend cuda` 时，才需要在配置阶段启用 ggml 的 CUDA backend：
 
 ```bash
-cmake -B build-cuda -DVOXCPM_CUDA=ON
+cmake -B build-cuda \
+  -DVOXCPM_CUDA=ON \
+  -DVOXCPM_BUILD_BENCHMARK=OFF \
+  -DVOXCPM_BUILD_TESTS=OFF \
+  -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build-cuda
 ```
 
 如果你希望同时保留 CPU 和 CUDA 两套构建，建议使用不同的构建目录，例如 `build` 和 `build-cuda`。
+
+重要提醒：
+
+- `-DVOXCPM_CUDA=ON` 只是在你要使用 `--backend cuda` 时才需要。
+- 如果你跑的是 `--backend cpu` 或其他非 CUDA 后端，不需要开启 CUDA 构建。
+- `-DCMAKE_CUDA_ARCHITECTURES=89` 只是 RTX 40 系列常见示例，不应盲目照抄。
+- 你应该根据自己的显卡架构设置 `-DCMAKE_CUDA_ARCHITECTURES`。
+- 常见取值：
+  - `86`：很多 RTX 30 系列
+  - `89`：很多 RTX 40 系列
+
+如果不确定，先确认自己的显卡型号，再决定这个值。
 
 ## 推理用法
 
@@ -83,6 +99,237 @@ cmake --build build-cuda
 ```
 
 `voxcpm_tts` 当前支持 `--backend {cpu|cuda|vulkan|auto}`。
+
+## OpenAI 兼容 TTS 服务
+
+`voxcpm-server` 现在提供单端口 HTTP 服务，同时支持：
+
+- `POST /v1/voices`
+- `GET /v1/voices/{id}`
+- `DELETE /v1/voices/{id}`
+- `POST /v1/audio/speech`
+
+### 完整接口列表
+
+#### `GET /healthz`
+
+健康检查接口。
+
+示例返回：
+
+```json
+{
+  "status": "ok"
+}
+```
+
+#### `POST /v1/voices`
+
+注册可复用的 voice，上传内容为：
+
+- multipart 字段 `id`：必填，唯一 voice id
+- multipart 字段 `text`：必填，参考音频对应文本
+- multipart 文件 `audio`：必填，参考音频文件
+
+成功返回：`201 Created`
+
+返回 JSON 字段：
+
+- `id`
+- `prompt_text`
+- `prompt_audio_length`
+- `sample_rate`
+- `patch_size`
+- `feat_dim`
+- `created_at`
+- `updated_at`
+
+#### `GET /v1/voices/{id}`
+
+查询已注册 voice 的元数据。
+
+成功返回：`200 OK`
+
+返回 JSON 字段：
+
+- `id`
+- `prompt_text`
+- `prompt_audio_length`
+- `sample_rate`
+- `patch_size`
+- `feat_dim`
+- `created_at`
+- `updated_at`
+
+#### `DELETE /v1/voices/{id}`
+
+删除已注册的 voice。
+
+成功返回：`200 OK`
+
+示例返回：
+
+```json
+{
+  "id": "taiyi",
+  "deleted": true
+}
+```
+
+#### `POST /v1/audio/speech`
+
+使用已注册的 voice id 从文本合成语音。
+
+JSON 请求字段：
+
+- `model`：必填字符串，必须和启动参数 `--model-name` 一致
+- `input`：必填字符串，长度范围 `1` 到 `4096`
+- `voice`：必填
+  - 可以直接传字符串 voice id，例如 `"taiyi"`
+  - 也可以传对象形式 `{ "id": "taiyi" }`
+- `response_format`：可选，支持 `mp3`、`flac`、`wav`、`pcm`
+- `speed`：可选浮点数，范围 `0.25` 到 `4.0`
+- `stream_format`：可选，支持 `audio` 或 `sse`
+- `instructions`：为兼容接口而保留，但只要传非空值目前就会报错
+
+返回行为：
+
+- `stream_format=audio` 或省略：
+  - 直接返回音频二进制
+  - `Content-Type` 与 `response_format` 对应
+- `stream_format=sse`：
+  - 返回 `text/event-stream`
+  - 发送：
+    - `event: audio.delta`
+    - `event: audio.completed`
+
+队列行为：
+
+- 单个 server 进程同一时间只处理一个合成请求
+- 额外请求进入等待队列，长度由 `--max-queue` 控制
+- 队列满时返回 `503`
+
+当前 `response_format` 仅支持：
+
+- `mp3`
+- `flac`
+- `wav`
+- `pcm`
+
+### 构建
+
+CUDA 部署推荐这样构建：
+
+```bash
+cmake -B build-cuda \
+  -DVOXCPM_CUDA=ON \
+  -DVOXCPM_BUILD_BENCHMARK=OFF \
+  -DVOXCPM_BUILD_TESTS=OFF \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+cmake --build build-cuda -j8
+```
+
+这套 CUDA 构建只在你准备以 `--backend cuda` 启动服务时才需要。
+如果你只想用 `--backend cpu`，普通 CPU 构建就够了：
+
+```bash
+cmake -B build -DVOXCPM_BUILD_BENCHMARK=OFF -DVOXCPM_BUILD_TESTS=OFF
+cmake --build build -j8
+```
+
+### 启动服务
+
+服务会在启动时自动创建 `--voice-dir`，目录不存在也没关系。
+
+CUDA 示例：
+
+```bash
+./build-cuda/examples/voxcpm-server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --model-path ./models/quantized/voxcpm1.5-q8_0-audiovae-f16.gguf \
+  --model-name voxcpm-1.5 \
+  --threads 8 \
+  --backend cuda \
+  --voice-dir ./runtime/voices \
+  --max-queue 8 \
+  --disable-auth
+```
+
+CPU 示例：
+
+```bash
+./build/examples/voxcpm-server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --model-path ./models/quantized/voxcpm1.5-q8_0-audiovae-f16.gguf \
+  --model-name voxcpm-1.5 \
+  --threads 8 \
+  --backend cpu \
+  --voice-dir ./runtime/voices \
+  --max-queue 8 \
+  --disable-auth
+```
+
+### 注册 voice
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/voices \
+  -F "id=taiyi" \
+  -F "text=对，这就是我，万人敬仰的太乙真人。" \
+  -F "audio=@./examples/tai_yi_xian_ren.wav"
+```
+
+示例返回：
+
+```json
+{
+  "created_at": "2026-03-18T11:32:51Z",
+  "feat_dim": 64,
+  "id": "taiyi",
+  "patch_size": 4,
+  "prompt_audio_length": 43,
+  "prompt_text": "对，这就是我，万人敬仰的太乙真人。",
+  "sample_rate": 44100,
+  "updated_at": "2026-03-18T11:32:51Z"
+}
+```
+
+### 合成语音
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "voxcpm-1.5",
+    "input": "大家好，我现在正在大可奇奇体验AI科技。",
+    "voice": "taiyi",
+    "response_format": "wav",
+    "speed": 1.0,
+    "stream_format": "audio"
+  }' \
+  --output ./voxcpm_taiyi.wav
+```
+
+### 说明
+
+- `voice` 字段当前直接传已注册的 voice id，例如 `"taiyi"`。
+- `instructions` 为兼容 OpenAI 请求体而保留，但 VoxCPM v1 还未实现。
+- `stream_format` 支持 `audio` 和 `sse`。
+- 如果你只需要本地离线推理，`examples/voxcpm_tts` 仍然是最简单的入口。
+- 如果启用了鉴权，上面所有接口都需要带 `Authorization: Bearer <api-key>`。
+- 错误返回格式如下：
+
+```json
+{
+  "error": {
+    "message": "可读错误信息",
+    "type": "invalid_request_error",
+    "code": "bad_request"
+  }
+}
+```
 
 ## Benchmark 脚本
 
@@ -144,7 +391,7 @@ ctest --output-on-failure
 
 1. 准备添加一个 WASM 用例，让用户可以直接在网页上试用 VoxCPM 模型。
 2. 继续优化推理性能。根据 `https://github.com/DakeQQ/Text-to-Speech-TTS-ONNX` 的报告，我们和它们当前展示的性能表现相比仍然有一段差距。
-3. 添加一个 `voxcpm-server` 程序，提供 OpenAI 格式的接口服务。
+3. 继续补全 OpenAI 兼容 TTS 服务和 voice 管理链路的测试覆盖。
 
 ## 预告
 

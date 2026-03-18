@@ -26,6 +26,7 @@ third_party/ggml/.cache/
 
 _fetch/
 logs/
+runtime/
 
 .emcache
 node_modules

@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.14)
 project(voxcpm
     VERSION 0.1.0
     DESCRIPTION "VoxCPM TTS Inference Engine with GGML"
-    LANGUAGES CXX
+    LANGUAGES CXX C
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -19,6 +19,8 @@ endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+
+find_package(Threads REQUIRED)
 
 if(EMSCRIPTEN AND VOXCPM_BUILD_WASM)
     add_compile_options(
@@ -66,6 +68,8 @@ endif()
 # =============================================================================
 
 add_library(voxcpm STATIC
+    third_party/miniaudio/miniaudio.c
+    src/audio_io.cpp
     src/audio-vae.cpp
     src/backend.cpp
     src/components.cpp
@@ -76,6 +80,7 @@ add_library(voxcpm STATIC
     src/locdit.cpp
     src/minicpm.cpp
     src/quantize.cpp
+    src/server_common.cpp
     src/tokenizer.cpp
     src/unified_cfm.cpp
     src/voxcpm.cpp
@@ -89,12 +94,15 @@ target_include_directories(voxcpm
     PRIVATE
         ${GGML_DIR}/include
         ${GGML_DIR}/src
+        ${CMAKE_SOURCE_DIR}/third_party/miniaudio
+        ${CMAKE_SOURCE_DIR}/third_party/json/include
 )
 
 target_link_libraries(voxcpm
     PUBLIC
         ggml
         ggml-base
+        Threads::Threads
 )
 
 target_compile_definitions(voxcpm

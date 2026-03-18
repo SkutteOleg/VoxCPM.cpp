@@ -28,14 +28,30 @@ cmake --build build
 
 ### CUDA Build
 
-Enable the ggml CUDA backend at configure time:
+Enable the ggml CUDA backend at configure time only if you want to run with `--backend cuda`:
 
 ```bash
-cmake -B build-cuda -DVOXCPM_CUDA=ON
+cmake -B build-cuda \
+  -DVOXCPM_CUDA=ON \
+  -DVOXCPM_BUILD_BENCHMARK=OFF \
+  -DVOXCPM_BUILD_TESTS=OFF \
+  -DCMAKE_CUDA_ARCHITECTURES=89
 cmake --build build-cuda
 ```
 
 If you want to keep both CPU and CUDA builds, use separate build directories such as `build` and `build-cuda`.
+
+Important:
+
+- `-DVOXCPM_CUDA=ON` is only needed when you want to use `--backend cuda`.
+- CPU-only and Vulkan builds do not need CUDA enabled.
+- `-DCMAKE_CUDA_ARCHITECTURES=89` is only an example for RTX 40-series GPUs.
+- You should set `-DCMAKE_CUDA_ARCHITECTURES` to match your own GPU architecture.
+- Common values:
+  - `86` for many RTX 30-series GPUs
+  - `89` for many RTX 40-series GPUs
+
+If you are unsure, check your GPU model first instead of copying `89` blindly.
 
 ## Inference
 
@@ -83,6 +99,237 @@ If you want to keep both CPU and CUDA builds, use separate build directories suc
 ```
 
 `voxcpm_tts` currently supports `--backend {cpu|cuda|vulkan|auto}`.
+
+## OpenAI-Compatible TTS Server
+
+`voxcpm-server` now exposes a single-port HTTP API for:
+
+- `POST /v1/voices`
+- `GET /v1/voices/{id}`
+- `DELETE /v1/voices/{id}`
+- `POST /v1/audio/speech`
+
+### Full Endpoint List
+
+#### `GET /healthz`
+
+Health check.
+
+Example response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+#### `POST /v1/voices`
+
+Registers a reusable voice entry by uploading:
+
+- multipart field `id`: required, unique voice id
+- multipart field `text`: required, transcript for the reference audio
+- multipart file `audio`: required, reference audio file
+
+Success response: `201 Created`
+
+Returned JSON fields:
+
+- `id`
+- `prompt_text`
+- `prompt_audio_length`
+- `sample_rate`
+- `patch_size`
+- `feat_dim`
+- `created_at`
+- `updated_at`
+
+#### `GET /v1/voices/{id}`
+
+Returns metadata for a previously registered voice id.
+
+Success response: `200 OK`
+
+Returned JSON fields:
+
+- `id`
+- `prompt_text`
+- `prompt_audio_length`
+- `sample_rate`
+- `patch_size`
+- `feat_dim`
+- `created_at`
+- `updated_at`
+
+#### `DELETE /v1/voices/{id}`
+
+Deletes a registered voice id.
+
+Success response: `200 OK`
+
+Example response:
+
+```json
+{
+  "id": "taiyi",
+  "deleted": true
+}
+```
+
+#### `POST /v1/audio/speech`
+
+Synthesizes speech from text using a registered voice id.
+
+JSON request fields:
+
+- `model`: required string, must match the configured `--model-name`
+- `input`: required string, 1 to 4096 characters
+- `voice`: required
+  - string voice id, for example `"taiyi"`
+  - or object form `{ "id": "taiyi" }`
+- `response_format`: optional, one of `mp3`, `flac`, `wav`, `pcm`
+- `speed`: optional float, range `0.25` to `4.0`
+- `stream_format`: optional, `audio` or `sse`
+- `instructions`: accepted for compatibility, but non-empty values currently return an error
+
+Response behavior:
+
+- `stream_format=audio` or omitted:
+  - returns raw audio bytes
+  - `Content-Type` matches `response_format`
+- `stream_format=sse`:
+  - returns `text/event-stream`
+  - emits:
+    - `event: audio.delta`
+    - `event: audio.completed`
+
+Queue behavior:
+
+- one synthesis request runs at a time per server process
+- additional requests wait in a bounded queue controlled by `--max-queue`
+- when the queue is full, the server returns `503`
+
+The server currently supports `response_format` values:
+
+- `mp3`
+- `flac`
+- `wav`
+- `pcm`
+
+### Build
+
+For CUDA deployment:
+
+```bash
+cmake -B build-cuda \
+  -DVOXCPM_CUDA=ON \
+  -DVOXCPM_BUILD_BENCHMARK=OFF \
+  -DVOXCPM_BUILD_TESTS=OFF \
+  -DCMAKE_CUDA_ARCHITECTURES=89
+
+cmake --build build-cuda -j8
+```
+
+This CUDA build is only required if you plan to launch the server with `--backend cuda`.
+If you want `--backend cpu`, a normal CPU build is enough:
+
+```bash
+cmake -B build -DVOXCPM_BUILD_BENCHMARK=OFF -DVOXCPM_BUILD_TESTS=OFF
+cmake --build build -j8
+```
+
+### Start The Server
+
+The server auto-creates `--voice-dir` if it does not exist.
+
+CUDA example:
+
+```bash
+./build-cuda/examples/voxcpm-server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --model-path ./models/quantized/voxcpm1.5-q8_0-audiovae-f16.gguf \
+  --model-name voxcpm-1.5 \
+  --threads 8 \
+  --backend cuda \
+  --voice-dir ./runtime/voices \
+  --max-queue 8 \
+  --disable-auth
+```
+
+CPU example:
+
+```bash
+./build/examples/voxcpm-server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --model-path ./models/quantized/voxcpm1.5-q8_0-audiovae-f16.gguf \
+  --model-name voxcpm-1.5 \
+  --threads 8 \
+  --backend cpu \
+  --voice-dir ./runtime/voices \
+  --max-queue 8 \
+  --disable-auth
+```
+
+### Register A Voice
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/voices \
+  -F "id=taiyi" \
+  -F "text=对，这就是我，万人敬仰的太乙真人。" \
+  -F "audio=@./examples/tai_yi_xian_ren.wav"
+```
+
+Example response:
+
+```json
+{
+  "created_at": "2026-03-18T11:32:51Z",
+  "feat_dim": 64,
+  "id": "taiyi",
+  "patch_size": 4,
+  "prompt_audio_length": 43,
+  "prompt_text": "对，这就是我，万人敬仰的太乙真人。",
+  "sample_rate": 44100,
+  "updated_at": "2026-03-18T11:32:51Z"
+}
+```
+
+### Synthesize Speech
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "voxcpm-1.5",
+    "input": "大家好，我现在正在大可奇奇体验AI科技。",
+    "voice": "taiyi",
+    "response_format": "wav",
+    "speed": 1.0,
+    "stream_format": "audio"
+  }' \
+  --output ./voxcpm_taiyi.wav
+```
+
+### Notes
+
+- The current server accepts a voice id string such as `"taiyi"` in the `voice` field.
+- `instructions` is accepted for compatibility but is not implemented in VoxCPM v1.
+- `stream_format` supports `audio` and `sse`.
+- If you only want local offline inference, `examples/voxcpm_tts` is still the simplest entry point.
+- When auth is enabled, every API route above requires `Authorization: Bearer <api-key>`.
+- Error responses use the shape:
+
+```json
+{
+  "error": {
+    "message": "Human-readable message",
+    "type": "invalid_request_error",
+    "code": "bad_request"
+  }
+}
+```
 
 ## Benchmark Scripts
 
@@ -144,7 +391,7 @@ See `docs/ggml_subtree_maintenance_strategy.md` for the longer-term maintenance 
 
 1. Add a WASM demo so users can try VoxCPM directly in the browser.
 2. Continue improving inference performance. Based on the benchmark report from `https://github.com/DakeQQ/Text-to-Speech-TTS-ONNX`, there is still a noticeable gap between the current performance here and their reported results.
-3. Add a `voxcpm-server` program that provides an OpenAI-compatible API service interface.
+3. Expand server-side test coverage for OpenAI-compatible TTS and voice-management flows.
 
 ## WASM Playground
 

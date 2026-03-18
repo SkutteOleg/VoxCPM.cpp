@@ -1,0 +1,295 @@
+#include "voxcpm/audio_io.h"
+
+#include "miniaudio.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+
+namespace voxcpm {
+
+namespace {
+
+struct MemoryWriter {
+    std::vector<uint8_t> bytes;
+};
+
+void fail_audio(const std::string& message) {
+    throw std::runtime_error(message);
+}
+
+ma_result encoder_write(ma_encoder* encoder, const void* pBufferIn, size_t bytesToWrite, size_t* pBytesWritten) {
+    auto* writer = static_cast<MemoryWriter*>(encoder->pUserData);
+    const auto* bytes = static_cast<const uint8_t*>(pBufferIn);
+    writer->bytes.insert(writer->bytes.end(), bytes, bytes + bytesToWrite);
+    if (pBytesWritten != nullptr) {
+        *pBytesWritten = bytesToWrite;
+    }
+    return MA_SUCCESS;
+}
+
+ma_result encoder_seek(ma_encoder* encoder, ma_int64 byteOffset, ma_seek_origin origin) {
+    auto* writer = static_cast<MemoryWriter*>(encoder->pUserData);
+    size_t target = 0;
+    if (origin == ma_seek_origin_start) {
+        if (byteOffset < 0) {
+            return MA_INVALID_ARGS;
+        }
+        target = static_cast<size_t>(byteOffset);
+    } else if (origin == ma_seek_origin_current) {
+        if (byteOffset < 0 && static_cast<size_t>(-byteOffset) > writer->bytes.size()) {
+            return MA_INVALID_ARGS;
+        }
+        target = byteOffset >= 0 ? writer->bytes.size() + static_cast<size_t>(byteOffset)
+                                 : writer->bytes.size() - static_cast<size_t>(-byteOffset);
+    } else {
+        return MA_INVALID_OPERATION;
+    }
+
+    writer->bytes.resize(target);
+    return MA_SUCCESS;
+}
+
+ma_encoding_format to_ma_encoding_format(AudioResponseFormat format) {
+    switch (format) {
+        case AudioResponseFormat::Mp3:
+            return ma_encoding_format_mp3;
+        case AudioResponseFormat::Flac:
+            return ma_encoding_format_flac;
+        case AudioResponseFormat::Wav:
+            return ma_encoding_format_wav;
+        default:
+            return ma_encoding_format_unknown;
+    }
+}
+
+std::vector<uint8_t> encode_pcm16_wav(const std::vector<float>& waveform, int sample_rate) {
+    const uint16_t channels = 1;
+    const uint16_t bits_per_sample = 16;
+    const uint32_t byte_rate = static_cast<uint32_t>(sample_rate) * channels * (bits_per_sample / 8);
+    const uint16_t block_align = channels * (bits_per_sample / 8);
+    const uint32_t data_size = static_cast<uint32_t>(waveform.size() * sizeof(int16_t));
+    const uint32_t riff_size = 36 + data_size;
+
+    std::vector<uint8_t> bytes;
+    bytes.reserve(44 + data_size);
+
+    const auto append_bytes = [&](const void* ptr, size_t len) {
+        const auto* begin = static_cast<const uint8_t*>(ptr);
+        bytes.insert(bytes.end(), begin, begin + len);
+    };
+
+    const uint32_t fmt_size = 16;
+    const uint16_t audio_format = 1;
+
+    append_bytes("RIFF", 4);
+    append_bytes(&riff_size, sizeof(riff_size));
+    append_bytes("WAVE", 4);
+    append_bytes("fmt ", 4);
+    append_bytes(&fmt_size, sizeof(fmt_size));
+    append_bytes(&audio_format, sizeof(audio_format));
+    append_bytes(&channels, sizeof(channels));
+    append_bytes(&sample_rate, sizeof(sample_rate));
+    append_bytes(&byte_rate, sizeof(byte_rate));
+    append_bytes(&block_align, sizeof(block_align));
+    append_bytes(&bits_per_sample, sizeof(bits_per_sample));
+    append_bytes("data", 4);
+    append_bytes(&data_size, sizeof(data_size));
+
+    for (float sample : waveform) {
+        const float clamped = std::max(-1.0f, std::min(1.0f, sample));
+        const int16_t pcm = static_cast<int16_t>(std::lrint(clamped * 32767.0f));
+        append_bytes(&pcm, sizeof(pcm));
+    }
+
+    return bytes;
+}
+
+}  // namespace
+
+DecodedAudio decode_audio_from_memory(const void* data, size_t size) {
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0);
+    ma_decoder decoder;
+    if (ma_decoder_init_memory(data, size, &config, &decoder) != MA_SUCCESS) {
+        fail_audio("Failed to decode uploaded audio");
+    }
+
+    ma_uint64 frame_count = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&decoder, &frame_count) != MA_SUCCESS) {
+        ma_decoder_uninit(&decoder);
+        fail_audio("Failed to inspect uploaded audio length");
+    }
+
+    std::vector<float> samples(static_cast<size_t>(frame_count) * decoder.outputChannels, 0.0f);
+    ma_uint64 frames_read = 0;
+    if (ma_decoder_read_pcm_frames(&decoder, samples.data(), frame_count, &frames_read) != MA_SUCCESS) {
+        ma_decoder_uninit(&decoder);
+        fail_audio("Failed to read uploaded audio samples");
+    }
+    const int output_sample_rate = static_cast<int>(decoder.outputSampleRate);
+    const int output_channels = static_cast<int>(decoder.outputChannels);
+    ma_decoder_uninit(&decoder);
+    samples.resize(static_cast<size_t>(frames_read) * static_cast<size_t>(output_channels));
+
+    return DecodedAudio{
+        output_sample_rate,
+        output_channels,
+        std::move(samples),
+    };
+}
+
+std::vector<float> convert_to_mono(const DecodedAudio& audio) {
+    if (audio.channels <= 1) {
+        return audio.samples;
+    }
+
+    const size_t frame_count = audio.samples.size() / static_cast<size_t>(audio.channels);
+    std::vector<float> mono(frame_count, 0.0f);
+    for (size_t frame = 0; frame < frame_count; ++frame) {
+        float sum = 0.0f;
+        for (int channel = 0; channel < audio.channels; ++channel) {
+            sum += audio.samples[frame * static_cast<size_t>(audio.channels) + static_cast<size_t>(channel)];
+        }
+        mono[frame] = sum / static_cast<float>(audio.channels);
+    }
+    return mono;
+}
+
+std::vector<float> resample_audio_to_rate(const std::vector<float>& input, int src_rate, int dst_rate) {
+    if (src_rate <= 0 || dst_rate <= 0 || input.empty() || src_rate == dst_rate) {
+        return input;
+    }
+
+    const double scale = static_cast<double>(dst_rate) / static_cast<double>(src_rate);
+    const size_t out_size = std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(input.size()) * scale)));
+    std::vector<float> out(out_size, 0.0f);
+    for (size_t i = 0; i < out_size; ++i) {
+        const double src_pos = static_cast<double>(i) / scale;
+        const size_t left = static_cast<size_t>(std::floor(src_pos));
+        const size_t right = std::min(left + 1, input.size() - 1);
+        const double frac = src_pos - static_cast<double>(left);
+        out[i] = static_cast<float>((1.0 - frac) * input[left] + frac * input[right]);
+    }
+    return out;
+}
+
+std::vector<float> resample_audio_linear(const std::vector<float>& input, double speed) {
+    if (input.empty() || speed <= 0.0 || std::abs(speed - 1.0) < 1e-6) {
+        return input;
+    }
+
+    const double scale = 1.0 / speed;
+    const size_t out_size = std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(input.size()) * scale)));
+    std::vector<float> out(out_size, 0.0f);
+    for (size_t i = 0; i < out_size; ++i) {
+        const double src_pos = static_cast<double>(i) / scale;
+        const size_t left = static_cast<size_t>(std::floor(src_pos));
+        const size_t right = std::min(left + 1, input.size() - 1);
+        const double frac = src_pos - static_cast<double>(left);
+        out[i] = static_cast<float>((1.0 - frac) * input[left] + frac * input[right]);
+    }
+    return out;
+}
+
+AudioResponseFormat parse_audio_response_format(const std::string& format) {
+    if (format == "mp3" || format.empty()) return AudioResponseFormat::Mp3;
+    if (format == "flac") return AudioResponseFormat::Flac;
+    if (format == "wav") return AudioResponseFormat::Wav;
+    if (format == "pcm") return AudioResponseFormat::Pcm;
+    fail_audio("Unsupported response_format: " + format + " (supported: mp3, flac, wav, pcm)");
+    return AudioResponseFormat::Mp3;
+}
+
+const char* audio_response_format_name(AudioResponseFormat format) {
+    switch (format) {
+        case AudioResponseFormat::Mp3: return "mp3";
+        case AudioResponseFormat::Flac: return "flac";
+        case AudioResponseFormat::Wav: return "wav";
+        case AudioResponseFormat::Pcm: return "pcm";
+        default: return "unknown";
+    }
+}
+
+const char* audio_content_type(AudioResponseFormat format) {
+    switch (format) {
+        case AudioResponseFormat::Mp3: return "audio/mpeg";
+        case AudioResponseFormat::Flac: return "audio/flac";
+        case AudioResponseFormat::Wav: return "audio/wav";
+        case AudioResponseFormat::Pcm: return "application/octet-stream";
+        default: return "application/octet-stream";
+    }
+}
+
+std::vector<uint8_t> encode_audio(AudioResponseFormat format,
+                                  const std::vector<float>& waveform,
+                                  int sample_rate) {
+    if (format == AudioResponseFormat::Wav) {
+        return encode_pcm16_wav(waveform, sample_rate);
+    }
+
+    if (format == AudioResponseFormat::Pcm) {
+        std::vector<uint8_t> bytes(waveform.size() * sizeof(int16_t), 0);
+        for (size_t i = 0; i < waveform.size(); ++i) {
+            const float clamped = std::max(-1.0f, std::min(1.0f, waveform[i]));
+            const int16_t pcm = static_cast<int16_t>(std::lrint(clamped * 32767.0f));
+            std::memcpy(bytes.data() + i * sizeof(int16_t), &pcm, sizeof(int16_t));
+        }
+        return bytes;
+    }
+
+    const ma_encoding_format ma_format = to_ma_encoding_format(format);
+    if (ma_format == ma_encoding_format_unknown) {
+        fail_audio(std::string("Requested response_format is not supported by this build: ") +
+                   audio_response_format_name(format));
+    }
+
+    MemoryWriter writer;
+    ma_encoder_config config = ma_encoder_config_init(ma_format, ma_format_f32, 1, static_cast<ma_uint32>(sample_rate));
+    ma_encoder encoder;
+    if (ma_encoder_init(encoder_write, encoder_seek, &writer, &config, &encoder) != MA_SUCCESS) {
+        fail_audio(std::string("Failed to initialize encoder for format ") + audio_response_format_name(format));
+    }
+
+    if (ma_encoder_write_pcm_frames(&encoder, waveform.data(), waveform.size(), nullptr) != MA_SUCCESS) {
+        ma_encoder_uninit(&encoder);
+        fail_audio(std::string("Failed to encode audio as ") + audio_response_format_name(format));
+    }
+    ma_encoder_uninit(&encoder);
+    return writer.bytes;
+}
+
+std::string base64_encode(const uint8_t* data, size_t size) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::string out;
+    out.reserve(((size + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 3 <= size) {
+        const uint32_t chunk = (static_cast<uint32_t>(data[i]) << 16) |
+                               (static_cast<uint32_t>(data[i + 1]) << 8) |
+                               static_cast<uint32_t>(data[i + 2]);
+        out.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+        out.push_back(kAlphabet[(chunk >> 6) & 0x3F]);
+        out.push_back(kAlphabet[chunk & 0x3F]);
+        i += 3;
+    }
+
+    const size_t remaining = size - i;
+    if (remaining > 0) {
+        uint32_t chunk = static_cast<uint32_t>(data[i]) << 16;
+        if (remaining == 2) {
+            chunk |= static_cast<uint32_t>(data[i + 1]) << 8;
+        }
+        out.push_back(kAlphabet[(chunk >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(chunk >> 12) & 0x3F]);
+        out.push_back(remaining == 2 ? kAlphabet[(chunk >> 6) & 0x3F] : '=');
+        out.push_back('=');
+    }
+
+    return out;
+}
+
+}  // namespace voxcpm

@@ -574,6 +574,22 @@ ggml_status VoxCPMBackend::compute(ggml_cgraph* graph) {
 // =============================================================================
 
 void VoxCPMBackend::tensor_set(ggml_tensor* tensor, const void* data, size_t offset, size_t size) {
+    if (!tensor) {
+        throw Error(ErrorCode::BackendError, "tensor_set received a null tensor");
+    }
+    if (!data && size > 0) {
+        throw Error(ErrorCode::BackendError, "tensor_set received a null data pointer");
+    }
+    const size_t tensor_bytes = ggml_nbytes(tensor);
+    if (offset > tensor_bytes || size > tensor_bytes - offset) {
+        std::ostringstream oss;
+        oss << "tensor_set overflow for tensor '" << tensor->name
+            << "': tensor_bytes=" << tensor_bytes
+            << ", offset=" << offset
+            << ", size=" << size;
+        throw Error(ErrorCode::BackendError, oss.str());
+    }
+
     const auto start = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(tensor, data, offset, size);
     const auto end = std::chrono::steady_clock::now();
