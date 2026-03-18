@@ -1,5 +1,7 @@
 # VoxCPM.cpp
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 基于 `ggml` 构建的 VoxCPM 模型独立 C++ 推理项目。
 
 VoxCPM 官方仓库：https://github.com/OpenBMB/VoxCPM

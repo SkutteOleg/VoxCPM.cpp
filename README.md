@@ -1,5 +1,7 @@
 # VoxCPM.cpp
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Standalone C++ inference project for VoxCPM models built on top of `ggml`.
 
 VoxCPM Official Repository: https://github.com/OpenBMB/VoxCPM
