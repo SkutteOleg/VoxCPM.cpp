@@ -1,0 +1,7 @@
+interface:
+  display_name: "VoxCPM Runtime Guard"
+  short_description: "Guardrails for VoxCPM GGML migration"
+  default_prompt: "Use $voxcpm-runtime-migration-guard to keep VoxCPM refactors aligned with the runtime plan and memory-transfer goals."
+
+policy:
+  allow_implicit_invocation: true

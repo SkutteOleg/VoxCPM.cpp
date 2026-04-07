@@ -59,3 +59,6 @@ voxcpm_add_test(test_imatrix test_imatrix.cpp)
 
 # Server utility tests
 voxcpm_add_test(test_server_common test_server_common.cpp)
+
+# Runtime skeleton tests
+voxcpm_add_test(test_runtime_skeleton test_runtime_skeleton.cpp)

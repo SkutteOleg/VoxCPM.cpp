@@ -9,13 +9,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${PROJECT_ROOT}/build"
-QUANTIZE_BIN="${BUILD_DIR}/examples/voxcpm_quantize"
+BUILD_TESTS_DIR="${PROJECT_ROOT}/build-tests"
+QUANTIZE_BIN="${BUILD_TESTS_DIR}/examples/voxcpm_quantize"
+if [[ ! -x "${QUANTIZE_BIN}" ]]; then
+    QUANTIZE_BIN="${BUILD_DIR}/examples/voxcpm_quantize"
+fi
 INFERENCE_BENCHMARK_SCRIPT="${SCRIPT_DIR}/benchmark_exported_weights.sh"
 OUTPUT_DIR="${PROJECT_ROOT}/models/quantized"
 LOG_DIR="${PROJECT_ROOT}/logs"
 
 # Models
-declare -a MODELS=("voxcpm1.5.gguf" "voxcpm-0.5b.gguf")
+declare -a MODELS=("voxcpm1.5.gguf" "voxcpm-0.5b.gguf" "voxcpm2.gguf")
 declare -a QUANT_TYPES=("Q4_K" "Q8_0" "F16")
 declare -a AUDIO_VAE_MODES=("mixed" "f16")
 QUANTIZE_THREADS=4

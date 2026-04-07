@@ -29,6 +29,7 @@ namespace {
 const std::string kModelPath = get_model_path();
 const std::string kTraceEncodePath = get_trace_path("trace_AudioVAE_encode.jsonl");
 const std::string kTraceDecodePath = get_trace_path("trace_AudioVAE_decode.jsonl");
+const std::string kVoxCPM2ModelPath = "/root/code/VoxCPM.cpp/models/voxcpm2.gguf";
 constexpr float kTargetMaxDiff = 2e-4f;
 constexpr float kCudaSmokeMaxDiff = 1e-1f;
 
@@ -158,6 +159,16 @@ bool all_finite(const std::vector<float>& values) {
     });
 }
 
+TEST_CASE("AudioVAEConfig output sample rate falls back to input sample rate", "[audio_vae][config]") {
+    AudioVAEConfig config;
+
+    REQUIRE(config.sample_rate == 16000);
+    REQUIRE(config.output_sample_rate() == 16000);
+
+    config.out_sample_rate = 48000;
+    REQUIRE(config.output_sample_rate() == 48000);
+}
+
 void print_error_stats(const char* label,
                        const std::vector<float>& input,
                        const std::vector<float>& expected,
@@ -279,6 +290,53 @@ TEST_CASE("AudioVAE loads config and weights from GGUF", "[audio_vae][weights]")
     REQUIRE(vae.weights().decoder_blocks.size() == 5);
 }
 
+TEST_CASE("AudioVAE loads VoxCPM2 sample-rate conditioning from GGUF", "[audio_vae][weights][voxcpm2][sr-cond]") {
+    if (!file_exists(kVoxCPM2ModelPath)) {
+        WARN("VoxCPM2 GGUF not found, skipping test");
+        return;
+    }
+
+    VoxCPMBackend backend(BackendType::CPU, cpu_thread_count());
+    VoxCPMContext weight_ctx(ContextType::Weights, 512);
+    VoxCPMContext graph_ctx(ContextType::Graph, 65536, 262144);
+
+    AudioVAE vae;
+    REQUIRE(vae.load_from_gguf(kVoxCPM2ModelPath, weight_ctx, graph_ctx, backend));
+
+    REQUIRE(vae.config().sample_rate == 16000);
+    REQUIRE(vae.config().output_sample_rate() == 48000);
+    REQUIRE(vae.config().sr_bin_boundaries == std::vector<int>({20000, 30000, 40000}));
+    REQUIRE(vae.config().sample_rate_bucket(16000) == 0);
+    REQUIRE(vae.config().sample_rate_bucket(20000) == 0);
+    REQUIRE(vae.config().sample_rate_bucket(20001) == 1);
+    REQUIRE(vae.config().sample_rate_bucket(48000) == 3);
+
+    REQUIRE(vae.weights().decoder_blocks.size() == 6);
+    REQUIRE(vae.weights().decoder_blocks.front().sr_cond.scale_embed != nullptr);
+    REQUIRE(vae.weights().decoder_blocks.front().sr_cond.bias_embed != nullptr);
+    REQUIRE(vae.weights().decoder_blocks.front().sr_cond.scale_embed->ne[0] == 2048);
+    REQUIRE(vae.weights().decoder_blocks.front().sr_cond.scale_embed->ne[1] == 4);
+
+    ggml_tensor* latent = graph_ctx.new_tensor_2d(GGML_TYPE_F32, 8, vae.config().latent_dim);
+    REQUIRE(latent != nullptr);
+    ggml_set_input(latent);
+    ggml_tensor* audio = vae.decode(graph_ctx, backend, latent);
+    REQUIRE(audio != nullptr);
+    REQUIRE(vae.last_decode_sr_cond_tensor() != nullptr);
+    REQUIRE(vae.last_decode_sr_bucket() == 3);
+
+    const std::vector<float> latent_input(static_cast<size_t>(8 * vae.config().latent_dim), 0.0f);
+    const GraphTimingStats timing = run_graph_with_timing(graph_ctx, backend, audio, [&]() {
+        backend.tensor_set(latent, latent_input.data(), 0, latent_input.size() * sizeof(float));
+        vae.prepare_decode_inputs(backend);
+    });
+
+    std::vector<float> actual(static_cast<size_t>(ggml_nelements(audio)), 0.0f);
+    backend.tensor_get(audio, actual.data(), 0, actual.size() * sizeof(float));
+    REQUIRE(all_finite(actual));
+    print_graph_timing("AudioVAE VoxCPM2 sr-cond decode", timing);
+}
+
 TEST_CASE("AudioVAE encode matches trace", "[audio_vae][encode][trace]") {
     if (!file_exists(kModelPath) || !file_exists(kTraceEncodePath)) {
         WARN("Encode test dependencies missing, skipping test");
@@ -350,6 +408,7 @@ TEST_CASE("AudioVAE decode matches trace", "[audio_vae][decode][trace]") {
 
     const GraphTimingStats timing = run_graph_with_timing(graph_ctx, backend, audio, [&]() {
         backend.tensor_set(latent, latent_input.data(), 0, latent_input.size() * sizeof(float));
+        vae.prepare_decode_inputs(backend);
     });
 
     std::vector<float> actual(expected.size(), 0.0f);
@@ -440,6 +499,7 @@ TEST_CASE("AudioVAE decode CUDA smoke", "[audio_vae][decode][cuda][smoke]") {
 
     const GraphTimingStats timing = run_graph_with_timing(graph_ctx, *backend, audio, [&]() {
         backend->tensor_set(latent, latent_input.data(), 0, latent_input.size() * sizeof(float));
+        vae.prepare_decode_inputs(*backend);
     });
 
     std::vector<float> actual(expected.size(), 0.0f);

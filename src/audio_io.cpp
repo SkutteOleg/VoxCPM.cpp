@@ -174,6 +174,64 @@ std::vector<float> resample_audio_to_rate(const std::vector<float>& input, int s
     return out;
 }
 
+std::vector<float> trim_audio_silence_vad(const std::vector<float>& input,
+                                          int sample_rate,
+                                          float max_silence_ms,
+                                          float top_db) {
+    if (input.empty() || sample_rate <= 0) {
+        return input;
+    }
+
+    constexpr int kFrameLength = 2048;
+    constexpr int kHopLength = 512;
+    const float ref = *std::max_element(input.begin(), input.end(), [](float a, float b) {
+        return std::fabs(a) < std::fabs(b);
+    });
+    if (std::fabs(ref) <= 0.0f) {
+        return input;
+    }
+
+    const float threshold = std::fabs(ref) * std::pow(10.0f, -top_db / 20.0f);
+    const size_t n = input.size();
+    int first_voice_frame = -1;
+    int last_voice_frame = -1;
+
+    for (size_t idx = 0, frame = 0; idx < n; idx += kHopLength, ++frame) {
+        const size_t frame_end = std::min(idx + static_cast<size_t>(kFrameLength), n);
+        const size_t frame_size = frame_end - idx;
+        if (frame_size == 0) {
+            break;
+        }
+        double energy = 0.0;
+        for (size_t i = idx; i < frame_end; ++i) {
+            energy += static_cast<double>(input[i]) * static_cast<double>(input[i]);
+        }
+        const float rms = static_cast<float>(std::sqrt(energy / static_cast<double>(frame_size)));
+        if (rms >= threshold) {
+            if (first_voice_frame < 0) {
+                first_voice_frame = static_cast<int>(frame);
+            }
+            last_voice_frame = static_cast<int>(frame);
+        }
+        if (frame_end == n) {
+            break;
+        }
+    }
+
+    if (first_voice_frame < 0 || last_voice_frame < 0) {
+        return input;
+    }
+
+    const int max_silence_samples = std::max(0, static_cast<int>(std::lround(max_silence_ms * sample_rate / 1000.0f)));
+    const int start = std::max(0, first_voice_frame * kHopLength - max_silence_samples);
+    const int end = std::min(static_cast<int>(n),
+                             (last_voice_frame + 1) * kHopLength + (kFrameLength - kHopLength) + max_silence_samples);
+    if (start >= end) {
+        return input;
+    }
+    return std::vector<float>(input.begin() + start, input.begin() + end);
+}
+
 std::vector<float> resample_audio_linear(const std::vector<float>& input, double speed) {
     if (input.empty() || speed <= 0.0 || std::abs(speed - 1.0) < 1e-6) {
         return input;

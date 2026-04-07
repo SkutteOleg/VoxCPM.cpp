@@ -149,12 +149,22 @@ def convert_weight_norm(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.
 
 def infer_model_name(model_path: Path, config: Dict[str, Any]) -> str:
     """Infer a human-friendly model name for GGUF metadata."""
+    architecture = config.get("architecture")
+    if isinstance(architecture, str) and architecture.strip():
+        arch_name = architecture.strip().lower()
+        if arch_name == "voxcpm2":
+            return "VoxCPM2"
+        if arch_name == "voxcpm":
+            return "VoxCPM"
+
     for key in ("model_name", "name"):
         value = config.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
 
     path_name = model_path.name.lower()
+    if "voxcpm2" in path_name or path_name.endswith("2"):
+        return "VoxCPM2"
     if "0.5b" in path_name:
         return "VoxCPM-0.5B"
     if "1.5" in path_name:
@@ -486,6 +496,10 @@ def map_tensor_name(name: str) -> str:
         return "proj.res_to_dit.weight"
     if name == "res_to_dit_proj.bias":
         return "proj.res_to_dit.bias"
+    if name == "fusion_concat_proj.weight":
+        return "proj.fusion_concat.weight"
+    if name == "fusion_concat_proj.bias":
+        return "proj.fusion_concat.bias"
 
     # Stop predictor
     if name.startswith("stop_"):

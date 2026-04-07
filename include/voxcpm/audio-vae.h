@@ -36,6 +36,20 @@ struct EncoderBlockWeights {
 };
 
 struct DecoderBlockWeights {
+    struct SampleRateConditionWeights {
+        ggml_tensor* scale_embed = nullptr;
+        ggml_tensor* bias_embed = nullptr;
+        ggml_tensor* cond_embed = nullptr;
+        ggml_tensor* out_snake_alpha = nullptr;
+        ggml_tensor* out_weight = nullptr;
+        ggml_tensor* out_bias = nullptr;
+
+        bool active() const {
+            return scale_embed != nullptr || bias_embed != nullptr || cond_embed != nullptr;
+        }
+    };
+
+    SampleRateConditionWeights sr_cond;
     ggml_tensor* snake_alpha = nullptr;
     ggml_tensor* conv_weight = nullptr;
     ggml_tensor* conv_bias = nullptr;
@@ -84,10 +98,13 @@ public:
     ggml_tensor* decode(VoxCPMContext& ctx,
                         const VoxCPMBackend& backend,
                         ggml_tensor* z);
+    void prepare_decode_inputs(VoxCPMBackend& backend) const;
 
     const AudioVAEConfig& config() const { return config_; }
     const AudioVAEWeights& weights() const { return weights_; }
     ggml_tensor* last_input_tensor() const { return last_input_tensor_; }
+    ggml_tensor* last_decode_sr_cond_tensor() const { return last_decode_sr_cond_tensor_; }
+    int32_t last_decode_sr_bucket() const { return last_decode_sr_bucket_; }
     const std::vector<float>& last_preprocessed_audio() const { return last_preprocessed_audio_; }
     const void* shared_store_token() const { return shared_store_.get(); }
     bool uses_shared_weights() const { return shared_store_ != nullptr; }
@@ -135,7 +152,12 @@ private:
                                        const VoxCPMBackend& backend,
                                        ggml_tensor* x,
                                        const DecoderBlockWeights& weights,
+                                       ggml_tensor* sr_bucket,
                                        int stride) const;
+    ggml_tensor* sample_rate_condition_forward(ggml_context* ctx,
+                                               ggml_tensor* x,
+                                               const DecoderBlockWeights::SampleRateConditionWeights& weights,
+                                               ggml_tensor* sr_bucket) const;
 
     ggml_tensor* encode_tensor(VoxCPMContext& ctx,
                                const VoxCPMBackend& backend,
@@ -156,6 +178,8 @@ private:
     ggml_context* weight_ctx_ = nullptr;
     ggml_backend_buffer_t weight_buffer_ = nullptr;
     ggml_tensor* last_input_tensor_ = nullptr;
+    ggml_tensor* last_decode_sr_cond_tensor_ = nullptr;
+    int32_t last_decode_sr_bucket_ = 0;
     std::vector<float> last_preprocessed_audio_;
     mutable std::vector<std::unique_ptr<AudioVAEDepthwiseConvOpData>> depthwise_ops_;
     std::shared_ptr<VoxCPMWeightStore> shared_store_;

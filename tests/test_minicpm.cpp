@@ -767,9 +767,20 @@ TEST_CASE("MiniCPMConfig defaults", "[minicpm][config]") {
     REQUIRE(config.n_layer == 8);
     REQUIRE(config.n_heads == 16);
     REQUIRE(config.n_kv_heads == 2);
+    REQUIRE(config.kv_channels == 64);
     REQUIRE(config.head_dim() == 64);
     REQUIRE(config.use_mup == false);
+    REQUIRE(config.no_rope == false);
     REQUIRE(config.scale_depth == Approx(1.4f));
+}
+
+TEST_CASE("MiniCPMConfig head_dim follows kv_channels", "[minicpm][config]") {
+    MiniCPMConfig config;
+    config.hidden_size = 1024;
+    config.n_heads = 16;
+    config.kv_channels = 128;
+
+    REQUIRE(config.head_dim() == 128);
 }
 
 TEST_CASE("MiniCPMKVCache init and views", "[minicpm][kv]") {

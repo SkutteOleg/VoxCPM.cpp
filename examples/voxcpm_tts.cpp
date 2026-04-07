@@ -4,6 +4,7 @@
  */
 
 #include "voxcpm/audio-vae.h"
+#include "voxcpm/audio_io.h"
 #include "voxcpm/backend.h"
 #include "voxcpm/context.h"
 #include "voxcpm/tokenizer.h"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -26,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace voxcpm {
@@ -36,6 +39,7 @@ struct Options {
     std::string output_path;
     std::string stream_dir;
     std::string prompt_audio_path;
+    std::string reference_audio_path;
     std::string prompt_text;
     std::string model_path;
     BackendType backend = BackendType::CPU;
@@ -44,6 +48,9 @@ struct Options {
     int threads = 4;
     bool normalize = false;
     bool stream = false;
+    bool retry_badcase = false;
+    int retry_badcase_max_times = 3;
+    float retry_badcase_ratio_threshold = 6.0f;
 };
 
 struct WavData {
@@ -58,9 +65,54 @@ struct PreparedInputs {
     std::vector<int32_t> feat_mask;
     std::vector<float> feat;
     std::vector<float> prompt_feat;
+    std::vector<float> reference_feat;
     int prompt_audio_length = 0;
+    int reference_audio_length = 0;
     bool has_prompt_audio = false;
+    bool has_reference_audio = false;
 };
+
+constexpr int32_t kAudioStartToken = 101;
+constexpr int32_t kRefAudioStartToken = 103;
+constexpr int32_t kRefAudioEndToken = 104;
+
+enum class PaddingMode {
+    Left,
+    Right,
+};
+
+size_t skip_ascii_whitespace(const std::string& text, size_t pos) {
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+        ++pos;
+    }
+    return pos;
+}
+
+std::pair<std::string, bool> strip_hifi_control_prefix(const std::string& text) {
+    const size_t start = skip_ascii_whitespace(text, 0);
+    if (start >= text.size()) {
+        return {text, false};
+    }
+
+    size_t content_start = std::string::npos;
+    size_t close_pos = std::string::npos;
+    size_t close_len = 0;
+    if (text.compare(start, 1, "(") == 0) {
+        content_start = start + 1;
+        close_pos = text.find(')', content_start);
+        close_len = 1;
+    } else if (text.compare(start, 3, "（") == 0) {
+        content_start = start + 3;
+        close_pos = text.find("）", content_start);
+        close_len = 3;
+    }
+    if (close_pos == std::string::npos) {
+        return {text, false};
+    }
+
+    const size_t next = skip_ascii_whitespace(text, close_pos + close_len);
+    return {text.substr(next), true};
+}
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
@@ -254,8 +306,12 @@ void print_usage(const char* argv0) {
               << "  --output, -o OUTPUT\n"
               << "  --prompt-audio, -pa PROMPT_AUDIO\n"
               << "  --prompt-text, -pt PROMPT_TEXT\n"
+              << "  --reference-audio, -ra REFERENCE_AUDIO\n"
               << "  --cfg-value FLOAT (default: 2.0)\n"
               << "  --inference-timesteps INT (default: 10)\n"
+              << "  --retry-badcase\n"
+              << "  --retry-badcase-max-times INT (default: 3)\n"
+              << "  --retry-badcase-ratio-threshold FLOAT (default: 6.0)\n"
               << "  --backend {cpu|cuda|vulkan|auto} (default: cpu)\n"
               << "  --threads INT (default: 4)\n"
               << "  --stream\n"
@@ -283,10 +339,18 @@ Options parse_args(int argc, char** argv) {
             options.prompt_audio_path = require_value("--prompt-audio");
         } else if (arg == "--prompt-text" || arg == "-pt") {
             options.prompt_text = require_value("--prompt-text");
+        } else if (arg == "--reference-audio" || arg == "-ra" || arg == "--reference-wav-path") {
+            options.reference_audio_path = require_value("--reference-audio");
         } else if (arg == "--cfg-value") {
             options.cfg_value = std::stof(require_value("--cfg-value"));
         } else if (arg == "--inference-timesteps") {
             options.inference_timesteps = std::stoi(require_value("--inference-timesteps"));
+        } else if (arg == "--retry-badcase") {
+            options.retry_badcase = true;
+        } else if (arg == "--retry-badcase-max-times") {
+            options.retry_badcase_max_times = std::stoi(require_value("--retry-badcase-max-times"));
+        } else if (arg == "--retry-badcase-ratio-threshold") {
+            options.retry_badcase_ratio_threshold = std::stof(require_value("--retry-badcase-ratio-threshold"));
         } else if (arg == "--backend") {
             options.backend = parse_backend_type(require_value("--backend"));
         } else if (arg == "--threads") {
@@ -328,6 +392,12 @@ Options parse_args(int argc, char** argv) {
     if (options.threads < 1) {
         fail("--threads must be >= 1");
     }
+    if (options.retry_badcase_max_times < 1) {
+        fail("--retry-badcase-max-times must be >= 1");
+    }
+    if (options.retry_badcase_ratio_threshold <= 0.0f) {
+        fail("--retry-badcase-ratio-threshold must be > 0");
+    }
     if (options.normalize) {
         fail("C++ text normalization not implemented");
     }
@@ -341,6 +411,13 @@ Options parse_args(int argc, char** argv) {
     }
     if (!options.prompt_audio_path.empty() && !std::filesystem::exists(options.prompt_audio_path)) {
         fail("Prompt audio file does not exist: " + options.prompt_audio_path);
+    }
+    if (!options.reference_audio_path.empty() && !std::filesystem::exists(options.reference_audio_path)) {
+        fail("Reference audio file does not exist: " + options.reference_audio_path);
+    }
+    if (options.retry_badcase && options.stream) {
+        std::cerr << "Warning: retry_badcase is not supported in streaming mode; disabling retries.\n";
+        options.retry_badcase = false;
     }
 
     return options;
@@ -501,6 +578,18 @@ std::vector<float> linear_resample(const std::vector<float>& input, int src_rate
     return out;
 }
 
+void pad_audio_for_patch_alignment(std::vector<float>& audio, size_t patch_len, PaddingMode mode) {
+    if (patch_len == 0 || audio.empty() || (audio.size() % patch_len) == 0) {
+        return;
+    }
+    const size_t padding = patch_len - (audio.size() % patch_len);
+    if (mode == PaddingMode::Left) {
+        audio.insert(audio.begin(), padding, 0.0f);
+    } else {
+        audio.insert(audio.end(), padding, 0.0f);
+    }
+}
+
 void write_wav_pcm16(const std::string& path, const std::vector<float>& audio, int sample_rate) {
     const std::filesystem::path output_path(path);
     if (output_path.has_parent_path()) {
@@ -554,8 +643,9 @@ std::vector<float> extract_prompt_features(AudioVAE& audio_vae,
                                            std::vector<float> audio,
                                            int sample_rate,
                                            int patch_size,
-                                           int feat_dim) {
-    std::cerr << "Encoding prompt audio...\n";
+                                           int feat_dim,
+                                           const char* label) {
+    std::cerr << "Encoding " << label << " audio...\n";
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
     ggml_tensor* latent = audio_vae.encode(graph_ctx, backend, audio, sample_rate);
     if (!latent) {
@@ -599,6 +689,28 @@ std::vector<float> extract_prompt_features(AudioVAE& audio_vae,
     return features;
 }
 
+std::vector<float> load_audio_features(const std::string& path,
+                                       PaddingMode padding_mode,
+                                       AudioVAE& audio_vae,
+                                       VoxCPMBackend& backend,
+                                       int patch_size,
+                                       int feat_dim,
+                                       int patch_len,
+                                       const char* label) {
+    const WavData wav = read_wav_file(path);
+    std::vector<float> mono = convert_to_mono(wav);
+    mono = linear_resample(mono, wav.sample_rate, audio_vae.config().sample_rate);
+    mono = trim_audio_silence_vad(mono, audio_vae.config().sample_rate);
+    pad_audio_for_patch_alignment(mono, static_cast<size_t>(patch_len), padding_mode);
+    return extract_prompt_features(audio_vae,
+                                   backend,
+                                   mono,
+                                   audio_vae.config().sample_rate,
+                                   patch_size,
+                                   feat_dim,
+                                   label);
+}
+
 std::vector<float> decode_audio(AudioVAE& audio_vae,
                                 VoxCPMBackend& backend,
                                 const std::vector<float>& features,
@@ -618,6 +730,7 @@ std::vector<float> decode_audio(AudioVAE& audio_vae,
     backend.reserve_compute_memory(graph, "tts.audio_vae.decode");
     backend.alloc_graph(graph, "tts.audio_vae.decode");
     backend.tensor_set(latent, features.data(), 0, features.size() * sizeof(float));
+    audio_vae.prepare_decode_inputs(backend);
     if (backend.compute(graph) != GGML_STATUS_SUCCESS) {
         fail("AudioVAE decode failed");
     }
@@ -802,6 +915,7 @@ void maybe_profile_front_half(bool enabled,
 }
 
 PreparedInputs prepare_inputs(const Options& options,
+                              const std::string& effective_text,
                               ChineseCharSplitTokenizer& split_tokenizer,
                               AudioVAE& audio_vae,
                               VoxCPMBackend& backend,
@@ -810,45 +924,91 @@ PreparedInputs prepare_inputs(const Options& options,
                               int patch_len) {
     PreparedInputs prepared;
 
-    std::vector<int32_t> text_tokens = split_tokenizer.encode(
-        options.prompt_audio_path.empty() ? options.text : options.prompt_text + options.text,
-        false);
-    text_tokens.push_back(101);
-
-    prepared.full_text_tokens = text_tokens;
-    if (options.prompt_audio_path.empty()) {
-        const int seq_len = static_cast<int>(text_tokens.size());
-        prepared.feat.assign(static_cast<size_t>(seq_len) * patch_size * feat_dim, 0.0f);
-        prepared.text_mask.assign(static_cast<size_t>(seq_len), 1);
-        prepared.feat_mask.assign(static_cast<size_t>(seq_len), 0);
-        return prepared;
+    if (!options.reference_audio_path.empty()) {
+        prepared.has_reference_audio = true;
+        prepared.reference_feat = load_audio_features(options.reference_audio_path,
+                                                      PaddingMode::Right,
+                                                      audio_vae,
+                                                      backend,
+                                                      patch_size,
+                                                      feat_dim,
+                                                      patch_len,
+                                                      "reference");
+        prepared.reference_audio_length =
+            static_cast<int>(prepared.reference_feat.size() / static_cast<size_t>(patch_size * feat_dim));
+    }
+    if (!options.prompt_audio_path.empty()) {
+        prepared.has_prompt_audio = true;
+        prepared.prompt_feat = load_audio_features(options.prompt_audio_path,
+                                                   PaddingMode::Left,
+                                                   audio_vae,
+                                                   backend,
+                                                   patch_size,
+                                                   feat_dim,
+                                                   patch_len,
+                                                   "prompt");
+        prepared.prompt_audio_length =
+            static_cast<int>(prepared.prompt_feat.size() / static_cast<size_t>(patch_size * feat_dim));
     }
 
-    prepared.has_prompt_audio = true;
-    const WavData wav = read_wav_file(options.prompt_audio_path);
-    std::vector<float> mono = convert_to_mono(wav);
-    mono = linear_resample(mono, wav.sample_rate, audio_vae.config().sample_rate);
-    if (mono.size() % static_cast<size_t>(patch_len) != 0) {
-        const size_t padding = static_cast<size_t>(patch_len) - (mono.size() % static_cast<size_t>(patch_len));
-        mono.insert(mono.begin(), padding, 0.0f);
+    const std::string main_text = prepared.has_prompt_audio ? options.prompt_text + effective_text : effective_text;
+    std::vector<int32_t> text_tokens = split_tokenizer.encode(main_text, false);
+    text_tokens.push_back(kAudioStartToken);
+
+    const size_t frame_stride = static_cast<size_t>(patch_size) * feat_dim;
+    const size_t total_frames = static_cast<size_t>(text_tokens.size()) +
+                                static_cast<size_t>(prepared.prompt_audio_length) +
+                                (prepared.has_reference_audio
+                                     ? static_cast<size_t>(prepared.reference_audio_length) + 2
+                                     : 0);
+    prepared.full_text_tokens.reserve(total_frames);
+    prepared.text_mask.reserve(total_frames);
+    prepared.feat_mask.reserve(total_frames);
+    prepared.feat.reserve(total_frames * frame_stride);
+
+    const auto append_zero_frame = [&]() {
+        prepared.feat.insert(prepared.feat.end(), frame_stride, 0.0f);
+    };
+    const auto append_feat_frames = [&](const std::vector<float>& frames, int frame_count) {
+        prepared.feat.insert(prepared.feat.end(),
+                             frames.begin(),
+                             frames.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(frame_count) * frame_stride));
+    };
+
+    if (prepared.has_reference_audio) {
+        prepared.full_text_tokens.push_back(kRefAudioStartToken);
+        prepared.text_mask.push_back(1);
+        prepared.feat_mask.push_back(0);
+        append_zero_frame();
+
+        for (int i = 0; i < prepared.reference_audio_length; ++i) {
+            prepared.full_text_tokens.push_back(0);
+            prepared.text_mask.push_back(0);
+            prepared.feat_mask.push_back(1);
+        }
+        append_feat_frames(prepared.reference_feat, prepared.reference_audio_length);
+
+        prepared.full_text_tokens.push_back(kRefAudioEndToken);
+        prepared.text_mask.push_back(1);
+        prepared.feat_mask.push_back(0);
+        append_zero_frame();
     }
 
-    prepared.prompt_feat = extract_prompt_features(
-        audio_vae, backend, mono, audio_vae.config().sample_rate, patch_size, feat_dim);
-    prepared.prompt_audio_length =
-        static_cast<int>(prepared.prompt_feat.size() / static_cast<size_t>(patch_size * feat_dim));
-    prepared.full_text_tokens.resize(text_tokens.size() + static_cast<size_t>(prepared.prompt_audio_length), 0);
+    for (int32_t token : text_tokens) {
+        prepared.full_text_tokens.push_back(token);
+        prepared.text_mask.push_back(1);
+        prepared.feat_mask.push_back(0);
+        append_zero_frame();
+    }
 
-    const int seq_len = static_cast<int>(prepared.full_text_tokens.size());
-    prepared.feat.assign(static_cast<size_t>(seq_len) * patch_size * feat_dim, 0.0f);
-    std::copy(prepared.prompt_feat.begin(),
-              prepared.prompt_feat.end(),
-              prepared.feat.begin() + static_cast<std::ptrdiff_t>(text_tokens.size()) * patch_size * feat_dim);
-
-    prepared.text_mask.assign(text_tokens.size(), 1);
-    prepared.text_mask.resize(seq_len, 0);
-    prepared.feat_mask.assign(text_tokens.size(), 0);
-    prepared.feat_mask.resize(seq_len, 1);
+    if (prepared.has_prompt_audio) {
+        for (int i = 0; i < prepared.prompt_audio_length; ++i) {
+            prepared.full_text_tokens.push_back(0);
+            prepared.text_mask.push_back(0);
+            prepared.feat_mask.push_back(1);
+        }
+        append_feat_frames(prepared.prompt_feat, prepared.prompt_audio_length);
+    }
     return prepared;
 }
 
@@ -860,7 +1020,7 @@ int main(int argc, char** argv) {
 
     try {
         const Options options = parse_args(argc, argv);
-        constexpr int kStreamingPrefixLen = 3;
+        constexpr int kStreamingPrefixLen = 4;
         const bool log_memory = env_flag_enabled("VOXCPM_LOG_MEMORY_BREAKDOWN");
         const bool log_decode_memory = env_flag_enabled("VOXCPM_LOG_DECODE_MEMORY");
         const int log_decode_memory_every = env_int_or_default("VOXCPM_LOG_DECODE_MEMORY_EVERY", 1);
@@ -904,165 +1064,197 @@ int main(int argc, char** argv) {
 
         // Detailed timing breakdown
         const auto encode_start = std::chrono::steady_clock::now();
+        std::string effective_text = options.text;
+        if (!options.prompt_audio_path.empty()) {
+            const auto [stripped_text, stripped] = strip_hifi_control_prefix(options.text);
+            if (stripped) {
+                std::cerr << "Hi-Fi mode ignores control instructions; stripping the leading parenthesized prefix.\n";
+                effective_text = stripped_text;
+            }
+        }
         const PreparedInputs prepared = prepare_inputs(
-            options, split_tokenizer, audio_vae, backend, patch_size, feat_dim, patch_len);
+            options, effective_text, split_tokenizer, audio_vae, backend, patch_size, feat_dim, patch_len);
         const auto encode_end = std::chrono::steady_clock::now();
         const double vae_encode_time = std::chrono::duration<double>(encode_end - encode_start).count();
 
         log_memory_breakdown(log_memory, "post_prompt_encode", *store, backend, nullptr);
-        const int seq_len = static_cast<int>(prepared.full_text_tokens.size());
-
-        const auto model_start = std::chrono::steady_clock::now();
-        std::cerr << "Running prefill, seq_len=" << seq_len << "...\n";
-        VoxCPMDecodeState state = runtime.prefill(prepared.full_text_tokens,
-                                                 prepared.text_mask,
-                                                 prepared.feat,
-                                                 prepared.feat_mask,
-                                                 seq_len,
-                                                 kStreamingPrefixLen);
-        log_memory_breakdown(log_memory, "post_prefill", *store, backend, &state);
-        maybe_profile_front_half(profile_front_half,
-                                 runtime,
-                                 state,
-                                 patch_size,
-                                 feat_dim,
-                                 options.inference_timesteps,
-                                 options.cfg_value);
-
         const int target_text_token_count =
-            std::max<int>(1, static_cast<int>(split_tokenizer.tokenize(options.text).size()));
-        const int natural_max_len = std::min(target_text_token_count * 6 + 10, 2000);
+            std::max<int>(1, static_cast<int>(split_tokenizer.tokenize(effective_text).size()));
         const int benchmark_decode_steps = env_nonnegative_int_or_default("VOXCPM_BENCHMARK_DECODE_STEPS", 0);
         const bool benchmark_ignore_stop = env_flag_enabled("VOXCPM_BENCHMARK_IGNORE_STOP");
+        const int natural_max_len =
+            std::min(static_cast<int>(target_text_token_count * options.retry_badcase_ratio_threshold + 10.0f), 2000);
         const int max_len = benchmark_decode_steps > 0 ? benchmark_decode_steps : natural_max_len;
         constexpr int kMinLen = 2;
-
-        std::mt19937 rng(std::random_device{}());
-        std::vector<float> generated_steps;
-        generated_steps.reserve(static_cast<size_t>(max_len) * patch_size * feat_dim);
-        std::vector<float> noise;
-        std::vector<float> stream_recent_frames;
-        std::vector<float> stream_latent;
-        if (options.stream) {
-            std::filesystem::create_directories(options.stream_dir);
-            const size_t frame_stride = static_cast<size_t>(patch_size) * feat_dim;
-            const int context_frames = (!prepared.prompt_feat.empty() && prepared.prompt_audio_length > 0 && kStreamingPrefixLen > 1)
-                ? std::min(kStreamingPrefixLen - 1, prepared.prompt_audio_length)
-                : 0;
-            if (context_frames > 0) {
-                const size_t context_offset = static_cast<size_t>(prepared.prompt_audio_length - context_frames) * frame_stride;
-                stream_recent_frames.insert(stream_recent_frames.end(),
-                                            prepared.prompt_feat.begin() + static_cast<std::ptrdiff_t>(context_offset),
-                                            prepared.prompt_feat.end());
-            }
-        }
-
-        std::cerr << "Running decode loop, max_len=" << max_len;
-        if (benchmark_decode_steps > 0) {
-            std::cerr << " (benchmark_steps=" << benchmark_decode_steps
-                      << ", ignore_stop=" << (benchmark_ignore_stop ? 1 : 0) << ")";
-        }
-        std::cerr << "...\n";
-        DecodeProgressPrinter decode_progress(max_len);
-        int stop_step_observed = -1;
-        for (int step = 0; step < max_len; ++step) {
-            fill_noise(noise, patch_size, feat_dim, rng);
-            VoxCPMDecodeResult result = runtime.decode(std::move(state),
-                                                       noise,
-                                                       options.inference_timesteps,
-                                                       options.cfg_value);
-            generated_steps.insert(generated_steps.end(), result.output_0.begin(), result.output_0.end());
-            state = std::move(result.output_1);
-            decode_progress.render(step + 1);
-
-            if (log_decode_memory && ((step + 1) % log_decode_memory_every == 0 || result.output_2)) {
-                decode_progress.clear_line();
-                const std::string stage = "decode_step_" + std::to_string(step + 1);
-                log_memory_breakdown(true, stage.c_str(), *store, backend, &state);
-                decode_progress.render(step + 1);
-            }
-
-            if (options.stream) {
-                append_stream_frame(stream_recent_frames,
-                                    result.output_0,
-                                    kStreamingPrefixLen,
-                                    patch_size,
-                                    feat_dim);
-                const int recent_frame_count =
-                    static_cast<int>(stream_recent_frames.size() / static_cast<size_t>(patch_size * feat_dim));
-                const int recent_patches = recent_frame_count * patch_size;
-                if (recent_patches > 0) {
-                    patch_major_to_latent(stream_recent_frames, patch_size, feat_dim, stream_latent);
-                    std::vector<float> chunk_waveform = decode_audio(audio_vae, backend, stream_latent, recent_patches, feat_dim);
-                    if (chunk_waveform.size() > static_cast<size_t>(patch_len)) {
-                        chunk_waveform.erase(chunk_waveform.begin(),
-                                             chunk_waveform.end() - static_cast<std::ptrdiff_t>(patch_len));
-                    }
-                    write_wav_pcm16(chunk_output_path(options.stream_dir, step),
-                                    chunk_waveform,
-                                    audio_vae.config().sample_rate);
-                }
-            }
-
-            if (step > kMinLen && result.output_2) {
-                const bool first_stop_observation = stop_step_observed < 0;
-                if (first_stop_observation) {
-                    stop_step_observed = step;
-                }
-                if (benchmark_decode_steps > 0 && benchmark_ignore_stop) {
-                    if (first_stop_observation) {
-                        decode_progress.clear_line();
-                        std::cerr << "Stop token observed at step " << step
-                                  << " (continuing due to benchmark mode).\n";
-                        decode_progress.render(step + 1);
-                    }
-                    continue;
-                }
-                decode_progress.clear_line();
-                std::cerr << "Stop token triggered at step " << step << ".\n";
-                break;
-            }
-        }
-        decode_progress.finish(static_cast<int>(generated_steps.size() / static_cast<size_t>(patch_size * feat_dim)));
-        if (benchmark_decode_steps > 0 && benchmark_ignore_stop && stop_step_observed >= 0) {
-            std::cerr << "First stop token was observed at step " << stop_step_observed << ".\n";
-        }
-
-        const int generated_frames = static_cast<int>(generated_steps.size() / static_cast<size_t>(patch_size * feat_dim));
+        const auto model_start = std::chrono::steady_clock::now();
+        std::vector<float> waveform;
+        VoxCPMDecodeState final_state;
+        double vae_decode_time = 0.0;
+        int generated_frames = 0;
         int prepended_context_frames = 0;
-        const std::vector<float> decode_frames = build_decode_feature_sequence(prepared.prompt_feat,
-                                                                               prepared.prompt_audio_length,
-                                                                               generated_steps,
-                                                                               kStreamingPrefixLen,
-                                                                               patch_size,
-                                                                               feat_dim,
-                                                                               &prepended_context_frames);
-        const int total_frames = static_cast<int>(decode_frames.size() / static_cast<size_t>(patch_size * feat_dim));
-        const int total_patches = total_frames * patch_size;
-        if (generated_frames == 0 || total_patches == 0) {
-            fail("Model generated no audio patches");
+
+        const int max_attempts = options.retry_badcase ? std::max(1, options.retry_badcase_max_times) : 1;
+        for (int attempt = 0; attempt < max_attempts; ++attempt) {
+            const int seq_len = static_cast<int>(prepared.full_text_tokens.size());
+            std::cerr << "Running prefill, seq_len=" << seq_len << " (attempt " << (attempt + 1)
+                      << "/" << max_attempts << ")...\n";
+            VoxCPMDecodeState state = runtime.prefill(prepared.full_text_tokens,
+                                                     prepared.text_mask,
+                                                     prepared.feat,
+                                                     prepared.feat_mask,
+                                                     seq_len,
+                                                     kStreamingPrefixLen);
+            log_memory_breakdown(log_memory, "post_prefill", *store, backend, &state);
+            if (attempt == 0) {
+                maybe_profile_front_half(profile_front_half,
+                                         runtime,
+                                         state,
+                                         patch_size,
+                                         feat_dim,
+                                         options.inference_timesteps,
+                                         options.cfg_value);
+            }
+
+            std::mt19937 rng(std::random_device{}());
+            std::vector<float> generated_steps;
+            generated_steps.reserve(static_cast<size_t>(max_len) * patch_size * feat_dim);
+            std::vector<float> noise;
+            std::vector<float> stream_recent_frames;
+            std::vector<float> stream_latent;
+            if (options.stream) {
+                std::filesystem::create_directories(options.stream_dir);
+                const size_t frame_stride = static_cast<size_t>(patch_size) * feat_dim;
+                const int context_frames = (prepared.has_prompt_audio && prepared.prompt_audio_length > 0 && kStreamingPrefixLen > 1)
+                    ? std::min(kStreamingPrefixLen - 1, prepared.prompt_audio_length)
+                    : 0;
+                if (context_frames > 0) {
+                    const size_t context_offset = static_cast<size_t>(prepared.prompt_audio_length - context_frames) * frame_stride;
+                    stream_recent_frames.insert(stream_recent_frames.end(),
+                                                prepared.prompt_feat.begin() + static_cast<std::ptrdiff_t>(context_offset),
+                                                prepared.prompt_feat.end());
+                }
+            }
+
+            std::cerr << "Running decode loop, max_len=" << max_len;
+            if (benchmark_decode_steps > 0) {
+                std::cerr << " (benchmark_steps=" << benchmark_decode_steps
+                          << ", ignore_stop=" << (benchmark_ignore_stop ? 1 : 0) << ")";
+            }
+            std::cerr << "...\n";
+            DecodeProgressPrinter decode_progress(max_len);
+            int stop_step_observed = -1;
+            for (int step = 0; step < max_len; ++step) {
+                fill_noise(noise, patch_size, feat_dim, rng);
+                VoxCPMDecodeResult result = runtime.decode(std::move(state),
+                                                           noise,
+                                                           options.inference_timesteps,
+                                                           options.cfg_value);
+                generated_steps.insert(generated_steps.end(), result.output_0.begin(), result.output_0.end());
+                state = std::move(result.output_1);
+                decode_progress.render(step + 1);
+
+                if (log_decode_memory && ((step + 1) % log_decode_memory_every == 0 || result.output_2)) {
+                    decode_progress.clear_line();
+                    const std::string stage = "decode_step_" + std::to_string(step + 1);
+                    log_memory_breakdown(true, stage.c_str(), *store, backend, &state);
+                    decode_progress.render(step + 1);
+                }
+
+                if (options.stream) {
+                    append_stream_frame(stream_recent_frames,
+                                        result.output_0,
+                                        kStreamingPrefixLen,
+                                        patch_size,
+                                        feat_dim);
+                    const int recent_frame_count =
+                        static_cast<int>(stream_recent_frames.size() / static_cast<size_t>(patch_size * feat_dim));
+                    const int recent_patches = recent_frame_count * patch_size;
+                    if (recent_patches > 0) {
+                        patch_major_to_latent(stream_recent_frames, patch_size, feat_dim, stream_latent);
+                        std::vector<float> chunk_waveform = decode_audio(audio_vae, backend, stream_latent, recent_patches, feat_dim);
+                        if (chunk_waveform.size() > static_cast<size_t>(patch_len)) {
+                            chunk_waveform.erase(chunk_waveform.begin(),
+                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(patch_len));
+                        }
+                        write_wav_pcm16(chunk_output_path(options.stream_dir, step),
+                                        chunk_waveform,
+                                        audio_vae.config().output_sample_rate());
+                    }
+                }
+
+                if (step > kMinLen && result.output_2) {
+                    const bool first_stop_observation = stop_step_observed < 0;
+                    if (first_stop_observation) {
+                        stop_step_observed = step;
+                    }
+                    if (benchmark_decode_steps > 0 && benchmark_ignore_stop) {
+                        if (first_stop_observation) {
+                            decode_progress.clear_line();
+                            std::cerr << "Stop token observed at step " << step
+                                      << " (continuing due to benchmark mode).\n";
+                            decode_progress.render(step + 1);
+                        }
+                        continue;
+                    }
+                    decode_progress.clear_line();
+                    std::cerr << "Stop token triggered at step " << step << ".\n";
+                    break;
+                }
+            }
+            decode_progress.finish(static_cast<int>(generated_steps.size() / static_cast<size_t>(patch_size * feat_dim)));
+            if (benchmark_decode_steps > 0 && benchmark_ignore_stop && stop_step_observed >= 0) {
+                std::cerr << "First stop token was observed at step " << stop_step_observed << ".\n";
+            }
+
+            generated_frames = static_cast<int>(generated_steps.size() / static_cast<size_t>(patch_size * feat_dim));
+            if (options.retry_badcase &&
+                generated_frames >= static_cast<int>(target_text_token_count * options.retry_badcase_ratio_threshold) &&
+                attempt + 1 < max_attempts) {
+                std::cerr << "Badcase detected, audio_text_ratio="
+                          << (static_cast<float>(generated_frames) / static_cast<float>(target_text_token_count))
+                          << ", retrying attempt " << (attempt + 2) << "/" << max_attempts << "...\n";
+                continue;
+            }
+
+            const std::vector<float> decode_frames = build_decode_feature_sequence(prepared.prompt_feat,
+                                                                                   prepared.prompt_audio_length,
+                                                                                   generated_steps,
+                                                                                   kStreamingPrefixLen,
+                                                                                   patch_size,
+                                                                                   feat_dim,
+                                                                                   &prepended_context_frames);
+            const int total_frames = static_cast<int>(decode_frames.size() / static_cast<size_t>(patch_size * feat_dim));
+            const int total_patches = total_frames * patch_size;
+            if (generated_frames == 0 || total_patches == 0) {
+                fail("Model generated no audio patches");
+            }
+
+            const auto decode_start = std::chrono::steady_clock::now();
+            const std::vector<float> latent = patch_major_to_latent(decode_frames, patch_size, feat_dim);
+            waveform = decode_audio(audio_vae, backend, latent, total_patches, feat_dim);
+            const auto decode_end = std::chrono::steady_clock::now();
+            vae_decode_time = std::chrono::duration<double>(decode_end - decode_start).count();
+            final_state = std::move(state);
+            break;
         }
 
         const auto model_end = std::chrono::steady_clock::now();
         const double model_time = std::chrono::duration<double>(model_end - model_start).count();
-
-        const auto decode_start = std::chrono::steady_clock::now();
-        const std::vector<float> latent = patch_major_to_latent(decode_frames, patch_size, feat_dim);
-        std::vector<float> waveform = decode_audio(audio_vae, backend, latent, total_patches, feat_dim);
-        const auto decode_end = std::chrono::steady_clock::now();
-        const double vae_decode_time = std::chrono::duration<double>(decode_end - decode_start).count();
-        log_memory_breakdown(log_memory, "post_waveform_decode", *store, backend, &state);
+        log_memory_breakdown(log_memory, "post_waveform_decode", *store, backend, &final_state);
         if (prepared.has_prompt_audio) {
             const size_t trim = static_cast<size_t>(patch_len) * static_cast<size_t>(prepended_context_frames);
             if (waveform.size() > trim) {
                 waveform.erase(waveform.begin(), waveform.begin() + static_cast<std::ptrdiff_t>(trim));
             }
         }
+        if (waveform.empty()) {
+            fail("Retry loop exhausted without producing an accepted sample");
+        }
 
-        write_wav_pcm16(options.output_path, waveform, audio_vae.config().sample_rate);
+        write_wav_pcm16(options.output_path, waveform, audio_vae.config().output_sample_rate());
 
         const double audio_seconds =
-            static_cast<double>(waveform.size()) / static_cast<double>(audio_vae.config().sample_rate);
+            static_cast<double>(waveform.size()) / static_cast<double>(audio_vae.config().output_sample_rate());
 
         // Calculate RTF values
         const double total_synth_time = vae_encode_time + model_time + vae_decode_time;

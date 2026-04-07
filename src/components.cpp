@@ -97,7 +97,7 @@ bool LinearProjection::load_from_store(const std::shared_ptr<VoxCPMWeightStore>&
     return true;
 }
 
-ggml_tensor* LinearProjection::forward(VoxCPMContext& ctx, ggml_tensor* input) {
+ggml_tensor* LinearProjection::forward(VoxCPMContext& ctx, ggml_tensor* input) const {
     VOXCPM_ASSERT(input != nullptr);
     VOXCPM_ASSERT(weights_.weight != nullptr);
     VOXCPM_ASSERT(input->ne[0] == weights_.weight->ne[0]);
@@ -154,7 +154,7 @@ bool StopTokenPredictor::load_from_store(const std::shared_ptr<VoxCPMWeightStore
     return true;
 }
 
-ggml_tensor* StopTokenPredictor::forward(VoxCPMContext& ctx, ggml_tensor* input) {
+ggml_tensor* StopTokenPredictor::forward(VoxCPMContext& ctx, ggml_tensor* input) const {
     VOXCPM_ASSERT(input != nullptr);
     VOXCPM_ASSERT(weights_.stop_proj_weight != nullptr);
     VOXCPM_ASSERT(weights_.stop_head_weight != nullptr);
@@ -276,6 +276,13 @@ std::unique_ptr<VoxCPMComponents> VoxCPMComponents::from_store(const std::shared
     }
     if (!load_projection(components->res_to_dit_proj_, "proj.res_to_dit")) {
         return nullptr;
+    }
+    if (store->get_tensor("proj.fusion_concat.weight") != nullptr) {
+        auto fusion_projection = std::make_unique<LinearProjection>(ProjectionConfig{hidden_dim * 2, hidden_dim});
+        if (!fusion_projection->load_from_store(store, "proj.fusion_concat")) {
+            return nullptr;
+        }
+        components->fusion_concat_proj_ = std::move(fusion_projection);
     }
 
     auto stop_token = std::make_unique<StopTokenPredictor>(StopTokenConfig{hidden_dim, 2});

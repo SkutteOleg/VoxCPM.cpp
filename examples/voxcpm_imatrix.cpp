@@ -11,6 +11,7 @@
 #include "voxcpm/weight-store.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -21,6 +22,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace voxcpm {
@@ -61,6 +63,39 @@ struct PreparedInputs {
 
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
+}
+
+size_t skip_ascii_whitespace(const std::string& text, size_t pos) {
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+        ++pos;
+    }
+    return pos;
+}
+
+std::pair<std::string, bool> strip_hifi_control_prefix(const std::string& text) {
+    const size_t start = skip_ascii_whitespace(text, 0);
+    if (start >= text.size()) {
+        return {text, false};
+    }
+
+    size_t content_start = std::string::npos;
+    size_t close_pos = std::string::npos;
+    size_t close_len = 0;
+    if (text.compare(start, 1, "(") == 0) {
+        content_start = start + 1;
+        close_pos = text.find(')', content_start);
+        close_len = 1;
+    } else if (text.compare(start, 3, "（") == 0) {
+        content_start = start + 3;
+        close_pos = text.find("）", content_start);
+        close_len = 3;
+    }
+    if (close_pos == std::string::npos) {
+        return {text, false};
+    }
+
+    const size_t next = skip_ascii_whitespace(text, close_pos + close_len);
+    return {text.substr(next), true};
 }
 
 void print_usage(const char* argv0) {
@@ -465,13 +500,14 @@ void collect_decode_audio_imatrix(AudioVAE& audio_vae,
     backend.reserve_compute_memory(graph, "imatrix.audio_vae.decode");
     backend.alloc_graph(graph, "imatrix.audio_vae.decode");
     backend.tensor_set(latent_tensor, latent.data(), 0, latent.size() * sizeof(float));
+    audio_vae.prepare_decode_inputs(backend);
     if (backend.compute(graph) != GGML_STATUS_SUCCESS) {
         fail("AudioVAE decode failed during imatrix collection");
     }
     collector->observe_graph(graph, backend);
 }
 
-PreparedInputs prepare_inputs(const std::string& text,
+PreparedInputs prepare_inputs(const std::string& effective_text,
                               const std::string& prompt_audio_path,
                               const std::string& prompt_text,
                               ChineseCharSplitTokenizer& split_tokenizer,
@@ -484,7 +520,7 @@ PreparedInputs prepare_inputs(const std::string& text,
     PreparedInputs prepared;
 
     std::vector<int32_t> text_tokens = split_tokenizer.encode(
-        prompt_audio_path.empty() ? text : prompt_text + text,
+        prompt_audio_path.empty() ? effective_text : prompt_text + effective_text,
         false);
     text_tokens.push_back(101);
 
@@ -557,7 +593,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        constexpr int kStreamingPrefixLen = 3;
+        constexpr int kStreamingPrefixLen = 4;
         constexpr int kMinStopStep = 2;
 
         VoxCPMBackend backend(BackendType::CPU, options.threads);
@@ -613,8 +649,17 @@ int main(int argc, char** argv) {
                 sample.prompt_audio_path.empty() ? options.prompt_audio_path : sample.prompt_audio_path;
             const std::string& active_prompt_text =
                 sample.prompt_audio_path.empty() ? options.prompt_text : sample.prompt_text;
+            std::string effective_text = sample.text;
+            if (!active_prompt_audio.empty()) {
+                const auto [stripped_text, stripped] = strip_hifi_control_prefix(sample.text);
+                if (stripped) {
+                    std::cerr << "Sample " << (i + 1)
+                              << ": Hi-Fi mode ignores control instructions; stripping the leading parenthesized prefix.\n";
+                    effective_text = stripped_text;
+                }
+            }
             const PreparedInputs prepared = prepare_inputs(
-                sample.text,
+                effective_text,
                 active_prompt_audio,
                 active_prompt_text,
                 split_tokenizer,
@@ -635,7 +680,7 @@ int main(int argc, char** argv) {
                                                      kStreamingPrefixLen);
 
             const int target_text_token_count =
-                std::max<int>(1, static_cast<int>(split_tokenizer.tokenize(sample.text).size()));
+                std::max<int>(1, static_cast<int>(split_tokenizer.tokenize(effective_text).size()));
             const int natural_max_len = std::min(target_text_token_count * 6 + 10, 2000);
             const int max_len = std::min(natural_max_len, options.max_decode_steps);
             std::vector<float> generated_steps;

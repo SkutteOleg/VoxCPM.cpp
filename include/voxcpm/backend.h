@@ -35,6 +35,8 @@ enum class BackendType {
 enum class BufferUsage {
     Weights,    // Read-only, persistent (model weights)
     KVCache,    // Read-write, persistent (KV cache)
+    State,      // Read-write, persistent (decode and cross-stage state)
+    Output,     // Stable outputs and cross-graph published tensors
     Compute,    // Read-write, dynamic (intermediate results)
 };
 

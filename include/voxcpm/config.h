@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace voxcpm {
 
@@ -38,6 +39,8 @@ struct AudioVAEConfig {
 
     // Sampling
     int sample_rate = 16000;    // Upstream torch default sample rate (Hz)
+    int out_sample_rate = 0;    // Optional decode/output sample rate (Hz)
+    std::vector<int> sr_bin_boundaries = {20000, 30000, 40000};
 
     // Encoder/Decoder rates (downsampling/upsampling factors)
     // Supports variable number of blocks via std::vector
@@ -49,6 +52,11 @@ struct AudioVAEConfig {
 
     // Noise injection (optional)
     bool use_noise_block = false;
+
+    // Decoder-side sample-rate conditioning (AudioVAE v2)
+    std::string cond_type = "scale_bias";
+    int cond_dim = 128;
+    bool cond_out_layer = false;
 
     /**
      * @brief Get hop length (total downsampling factor)
@@ -69,6 +77,19 @@ struct AudioVAEConfig {
      * @brief Get number of decoder blocks
      */
     int num_decoder_blocks() const { return static_cast<int>(decoder_rates.size()); }
+
+    int output_sample_rate() const { return out_sample_rate > 0 ? out_sample_rate : sample_rate; }
+
+    int sr_bin_bucket_count() const { return static_cast<int>(sr_bin_boundaries.size()) + 1; }
+
+    int sample_rate_bucket(int sample_rate_hz) const {
+        int bucket = 0;
+        while (bucket < static_cast<int>(sr_bin_boundaries.size()) &&
+               sample_rate_hz > sr_bin_boundaries[static_cast<size_t>(bucket)]) {
+            ++bucket;
+        }
+        return bucket;
+    }
 
     /**
      * @brief Calculate encoder channel progression
@@ -117,6 +138,7 @@ struct MiniCPMConfig {
     int n_layer = 8;
     int n_heads = 16;
     int n_kv_heads = 2;          // GQA: 16 query heads, 2 KV heads
+    int kv_channels = 64;        // Per-head Q/K/V channel width
     int vocab_size = 73448;
     int max_length = 32768;
 
@@ -128,13 +150,14 @@ struct MiniCPMConfig {
     int dim_model_base = 256;
     float scale_depth = 1.4f;
     bool use_mup = false;
+    bool no_rope = false;
 
     // LongRoPE configuration
     int rope_original_max = 32768;
     std::vector<float> rope_long_factor;
     std::vector<float> rope_short_factor;
 
-    int head_dim() const { return hidden_size / n_heads; }
+    int head_dim() const { return kv_channels > 0 ? kv_channels : hidden_size / n_heads; }
 };
 
 // =============================================================================

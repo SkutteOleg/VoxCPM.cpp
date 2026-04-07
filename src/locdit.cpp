@@ -257,17 +257,19 @@ ggml_tensor* LocDiTModel::project_condition(VoxCPMContext& ctx, ggml_tensor* con
     return ggml_add(raw, cond_proj, weights_.cond_proj_bias);
 }
 
-ggml_tensor* LocDiTModel::build_combined_token(VoxCPMContext& ctx,
-                                               ggml_tensor* mu,
-                                               ggml_tensor* t_scalar,
-                                               ggml_tensor* dt_scalar) const {
+ggml_tensor* LocDiTModel::build_time_token(VoxCPMContext& ctx,
+                                           ggml_tensor* t_scalar,
+                                           ggml_tensor* dt_scalar) const {
     ggml_context* raw = ctx.raw_context();
-    ggml_tensor* combined = compute_time_embedding(ctx, t_scalar);
-    combined = ggml_add(raw, combined, compute_delta_time_embedding(ctx, dt_scalar));
-    if (mu) {
-        combined = ggml_add(raw, mu, combined);
-    }
-    return ggml_reshape_2d(raw, combined, config().hidden_size, 1);
+    ggml_tensor* time_token = compute_time_embedding(ctx, t_scalar);
+    time_token = ggml_add(raw, time_token, compute_delta_time_embedding(ctx, dt_scalar));
+    return ggml_reshape_2d(raw, time_token, config().hidden_size, 1);
+}
+
+ggml_tensor* LocDiTModel::reshape_mu_tokens(VoxCPMContext& ctx, ggml_tensor* mu) const {
+    VOXCPM_ASSERT(mu != nullptr);
+    VOXCPM_ASSERT(mu->ne[0] % config().hidden_size == 0);
+    return ggml_reshape_2d(ctx.raw_context(), mu, config().hidden_size, mu->ne[0] / config().hidden_size);
 }
 
 ggml_tensor* LocDiTModel::build_cfg_pair_positions(VoxCPMContext& ctx, int branch_len) const {
@@ -306,19 +308,20 @@ ggml_tensor* LocDiTModel::build_cfg_pair_attention_mask(VoxCPMContext& ctx, int 
 
 ggml_tensor* LocDiTModel::forward_projected(VoxCPMContext& ctx,
                                             ggml_tensor* x_proj,
-                                            ggml_tensor* combined_token,
+                                            ggml_tensor* prefix_tokens,
                                             ggml_tensor* cond_proj,
+                                            int generated_prefix_tokens,
                                             int prefix_len,
                                             int seq_len) {
     VOXCPM_ASSERT(x_proj != nullptr);
-    VOXCPM_ASSERT(combined_token != nullptr);
+    VOXCPM_ASSERT(prefix_tokens != nullptr);
     VOXCPM_ASSERT(backend_ != nullptr);
     VOXCPM_ASSERT(scratch_kv_cache_ != nullptr);
 
     ggml_context* raw = ctx.raw_context();
     const int hidden_size = config().hidden_size;
 
-    ggml_tensor* seq = combined_token;
+    ggml_tensor* seq = prefix_tokens;
     if (cond_proj && prefix_len > 0) {
         seq = ggml_concat(raw, seq, cond_proj, 1);
     }
@@ -330,7 +333,7 @@ ggml_tensor* LocDiTModel::forward_projected(VoxCPMContext& ctx,
                                            hidden_size,
                                            seq_len,
                                            hidden->nb[1],
-                                           static_cast<size_t>(prefix_len + 1) * hidden->nb[1]);
+                                           static_cast<size_t>(prefix_len + generated_prefix_tokens) * hidden->nb[1]);
     ggml_tensor* output = ggml_mul_mat(raw, weights_.out_proj_weight, hidden_out);
     return ggml_add(raw, output, weights_.out_proj_bias);
 }
@@ -351,15 +354,30 @@ ggml_tensor* LocDiTModel::forward_single(VoxCPMContext& ctx,
     const int64_t seq_len = x->ne[1];
     const int64_t prefix_len = cond ? cond->ne[1] : 0;
     const int hidden_size = config().hidden_size;
+    const int64_t mu_tokens = mu->ne[0] / hidden_size;
 
     VOXCPM_ASSERT(x->ne[0] == feat_dim_);
-    VOXCPM_ASSERT(mu->ne[0] == hidden_size);
-    VOXCPM_ASSERT(prefix_len + seq_len + 1 <= config().max_length);
+    VOXCPM_ASSERT(mu->ne[0] % hidden_size == 0);
+    VOXCPM_ASSERT(prefix_len + seq_len + mu_tokens + 1 <= config().max_length);
 
     ggml_tensor* x_proj = project_input(ctx, x);
     ggml_tensor* cond_proj = (cond && prefix_len > 0) ? project_condition(ctx, cond) : nullptr;
-    ggml_tensor* combined = build_combined_token(ctx, mu, t_scalar, dt_scalar);
-    return forward_projected(ctx, x_proj, combined, cond_proj, static_cast<int>(prefix_len), static_cast<int>(seq_len));
+    ggml_tensor* time_token = build_time_token(ctx, t_scalar, dt_scalar);
+    if (mu_tokens == 1) {
+        ggml_tensor* combined = ggml_add(ctx.raw_context(), ggml_reshape_1d(ctx.raw_context(), mu, hidden_size), time_token);
+        combined = ggml_reshape_2d(ctx.raw_context(), combined, hidden_size, 1);
+        return forward_projected(
+            ctx, x_proj, combined, cond_proj, 1, static_cast<int>(prefix_len), static_cast<int>(seq_len));
+    }
+
+    ggml_tensor* prefix_tokens = ggml_concat(ctx.raw_context(), reshape_mu_tokens(ctx, mu), time_token, 1);
+    return forward_projected(ctx,
+                             x_proj,
+                             prefix_tokens,
+                             cond_proj,
+                             static_cast<int>(mu_tokens + 1),
+                             static_cast<int>(prefix_len),
+                             static_cast<int>(seq_len));
 }
 
 std::vector<float> LocDiTModel::precompute_cfg_time_table(const std::vector<float>& t_values) const {
@@ -401,7 +419,7 @@ std::vector<float> LocDiTModel::precompute_cfg_time_table(const std::vector<floa
 void LocDiTModel::forward_cfg_pair_projected(VoxCPMContext& ctx,
                                              ggml_tensor* x_proj,
                                              ggml_tensor* mu,
-                                             ggml_tensor* combined_base,
+                                             ggml_tensor* time_token,
                                              ggml_tensor* cond_proj,
                                              int prefix_len,
                                              ggml_tensor** conditioned,
@@ -410,28 +428,41 @@ void LocDiTModel::forward_cfg_pair_projected(VoxCPMContext& ctx,
     VOXCPM_ASSERT(unconditioned != nullptr);
     VOXCPM_ASSERT(x_proj != nullptr);
     VOXCPM_ASSERT(mu != nullptr);
-    VOXCPM_ASSERT(combined_base != nullptr);
+    VOXCPM_ASSERT(time_token != nullptr);
 
     const int seq_len = static_cast<int>(x_proj->ne[1]);
+    const int mu_tokens = static_cast<int>(mu->ne[0] / config().hidden_size);
     VOXCPM_ASSERT(x_proj->ne[0] == config().hidden_size);
-    VOXCPM_ASSERT(mu->ne[0] == config().hidden_size);
-    VOXCPM_ASSERT(prefix_len + seq_len + 1 <= config().max_length);
+    VOXCPM_ASSERT(mu->ne[0] % config().hidden_size == 0);
+    VOXCPM_ASSERT(prefix_len + seq_len + mu_tokens + 1 <= config().max_length);
 
     ggml_context* raw = ctx.raw_context();
-    ggml_tensor* combined_cond = ggml_add(raw, ggml_reshape_1d(raw, combined_base, combined_base->ne[0]), mu);
-    combined_cond = ggml_reshape_2d(raw, combined_cond, config().hidden_size, 1);
-    ggml_tensor* combined_base_2d = ggml_reshape_2d(raw, combined_base, config().hidden_size, 1);
+    ggml_tensor* conditioned_prefix = nullptr;
+    ggml_tensor* unconditioned_prefix = nullptr;
+    if (mu_tokens == 1) {
+        ggml_tensor* conditioned_token = ggml_add(raw, ggml_reshape_1d(raw, time_token, time_token->ne[0]), mu);
+        conditioned_prefix = ggml_reshape_2d(raw, conditioned_token, config().hidden_size, 1);
+        unconditioned_prefix = ggml_reshape_2d(raw, ggml_reshape_1d(raw, time_token, time_token->ne[0]), config().hidden_size, 1);
+    } else {
+        ggml_tensor* mu_prefix = reshape_mu_tokens(ctx, mu);
+        ggml_tensor* zero_mu_prefix = ggml_scale(raw, mu_prefix, 0.0f);
+        conditioned_prefix = ggml_concat(raw, mu_prefix, time_token, 1);
+        unconditioned_prefix = ggml_concat(raw, zero_mu_prefix, time_token, 1);
+    }
 
-    const int branch_len = prefix_len + seq_len + 1;
+    const int generated_prefix_tokens = mu_tokens == 1 ? 1 : mu_tokens + 1;
+    const int branch_len = prefix_len + seq_len + generated_prefix_tokens;
     const int total_len = branch_len * 2;
     if (total_len > config().max_length) {
-        *conditioned = forward_projected(ctx, x_proj, combined_cond, cond_proj, prefix_len, seq_len);
-        *unconditioned = forward_projected(ctx, x_proj, combined_base_2d, cond_proj, prefix_len, seq_len);
+        *conditioned = forward_projected(
+            ctx, x_proj, conditioned_prefix, cond_proj, generated_prefix_tokens, prefix_len, seq_len);
+        *unconditioned = forward_projected(
+            ctx, x_proj, unconditioned_prefix, cond_proj, generated_prefix_tokens, prefix_len, seq_len);
         return;
     }
 
-    ggml_tensor* conditioned_seq = combined_cond;
-    ggml_tensor* unconditioned_seq = combined_base_2d;
+    ggml_tensor* conditioned_seq = conditioned_prefix;
+    ggml_tensor* unconditioned_seq = unconditioned_prefix;
     if (cond_proj && prefix_len > 0) {
         conditioned_seq = ggml_concat(raw, conditioned_seq, cond_proj, 1);
         unconditioned_seq = ggml_concat(raw, unconditioned_seq, cond_proj, 1);
@@ -449,13 +480,14 @@ void LocDiTModel::forward_cfg_pair_projected(VoxCPMContext& ctx,
                                                    config().hidden_size,
                                                    seq_len,
                                                    paired_hidden->nb[1],
-                                                   static_cast<size_t>(prefix_len + 1) * paired_hidden->nb[1]);
+                                                   static_cast<size_t>(prefix_len + generated_prefix_tokens) * paired_hidden->nb[1]);
     ggml_tensor* unconditioned_hidden = ggml_view_2d(raw,
                                                      paired_hidden,
                                                      config().hidden_size,
                                                      seq_len,
                                                      paired_hidden->nb[1],
-                                                     static_cast<size_t>(branch_len + prefix_len + 1) * paired_hidden->nb[1]);
+                                                     static_cast<size_t>(branch_len + prefix_len + generated_prefix_tokens) *
+                                                         paired_hidden->nb[1]);
 
     ggml_tensor* conditioned_out = ggml_mul_mat(raw, weights_.out_proj_weight, conditioned_hidden);
     ggml_tensor* unconditioned_out = ggml_mul_mat(raw, weights_.out_proj_weight, unconditioned_hidden);
@@ -484,7 +516,7 @@ ggml_tensor* LocDiTModel::forward(VoxCPMContext& ctx,
     VOXCPM_ASSERT(ggml_n_dims(dt) == 1);
     VOXCPM_ASSERT(x->ne[0] == feat_dim_);
     VOXCPM_ASSERT(cond->ne[0] == feat_dim_);
-    VOXCPM_ASSERT(mu->ne[0] == config().hidden_size);
+    VOXCPM_ASSERT(mu->ne[0] % config().hidden_size == 0);
 
     const int64_t batch = std::max<int64_t>(1, std::max<int64_t>(x->ne[2], std::max<int64_t>(cond->ne[2], mu->ne[1])));
     VOXCPM_ASSERT(cond->ne[2] == 1 || cond->ne[2] == batch);
@@ -546,19 +578,18 @@ void LocDiTModel::forward_cfg_pair(VoxCPMContext& ctx,
 
     const int64_t seq_len = x->ne[1];
     const int64_t prefix_len = cond ? cond->ne[1] : 0;
+    const int64_t mu_tokens = mu->ne[0] / config().hidden_size;
     VOXCPM_ASSERT(x->ne[0] == feat_dim_);
-    VOXCPM_ASSERT(mu->ne[0] == config().hidden_size);
-    VOXCPM_ASSERT(prefix_len + seq_len + 1 <= config().max_length);
+    VOXCPM_ASSERT(mu->ne[0] % config().hidden_size == 0);
+    VOXCPM_ASSERT(prefix_len + seq_len + mu_tokens + 1 <= config().max_length);
 
     ggml_tensor* x_proj = project_input(ctx, x);
     ggml_tensor* cond_proj = prefix_len > 0 ? project_condition(ctx, cond) : nullptr;
-    ggml_tensor* delta_time_embedding = compute_delta_time_embedding(ctx, dt_scalar);
-    ggml_tensor* combined_base = compute_time_embedding(ctx, t_scalar);
-    combined_base = ggml_add(ctx.raw_context(), combined_base, delta_time_embedding);
+    ggml_tensor* time_token = build_time_token(ctx, t_scalar, dt_scalar);
     forward_cfg_pair_projected(ctx,
                                x_proj,
                                mu,
-                               combined_base,
+                               time_token,
                                cond_proj,
                                static_cast<int>(prefix_len),
                                conditioned,

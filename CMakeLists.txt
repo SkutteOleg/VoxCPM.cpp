@@ -74,13 +74,17 @@ add_library(voxcpm STATIC
     src/backend.cpp
     src/components.cpp
     src/context.cpp
+    src/graph-cache.cpp
     src/fsq.cpp
+    src/output.cpp
     src/imatrix.cpp
     src/localenc.cpp
     src/locdit.cpp
     src/minicpm.cpp
     src/quantize.cpp
+    src/runtime.cpp
     src/server_common.cpp
+    src/state.cpp
     src/tokenizer.cpp
     src/unified_cfm.cpp
     src/voxcpm.cpp

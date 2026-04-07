@@ -8,6 +8,7 @@
 #include "voxcpm/backend.h"
 #include "voxcpm/weight-store.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -181,6 +182,10 @@ static bool get_required_tensor(ggml_context* ctx, const std::string& name, ggml
     return *dst != nullptr;
 }
 
+static ggml_tensor* get_optional_tensor(ggml_context* ctx, const std::string& name) {
+    return ctx ? ggml_get_tensor(ctx, name.c_str()) : nullptr;
+}
+
 static ggml_tensor* reshape_bias_3d(ggml_context* ctx, ggml_tensor* bias) {
     const int64_t channels = bias->ne[0];
     return ggml_reshape_3d(ctx, bias, 1, channels, 1);
@@ -301,6 +306,14 @@ bool AudioVAE::load_decoder_weights(ggml_context* ggml_ctx_ptr) {
         DecoderBlockWeights& block = weights_.decoder_blocks[static_cast<size_t>(i)];
         const int model_idx = i + 2;
         const std::string block_prefix = "audio_vae.decoder.model." + std::to_string(model_idx) + ".block.";
+        const std::string sr_cond_prefix = "audio_vae.decoder.sr_cond_model." + std::to_string(model_idx) + ".";
+
+        block.sr_cond.scale_embed = get_optional_tensor(ggml_ctx_ptr, sr_cond_prefix + "scale_embed.weight");
+        block.sr_cond.bias_embed = get_optional_tensor(ggml_ctx_ptr, sr_cond_prefix + "bias_embed.weight");
+        block.sr_cond.cond_embed = get_optional_tensor(ggml_ctx_ptr, sr_cond_prefix + "cond_embed.weight");
+        block.sr_cond.out_snake_alpha = get_optional_tensor(ggml_ctx_ptr, sr_cond_prefix + "out_layer.0.alpha");
+        block.sr_cond.out_weight = get_optional_tensor(ggml_ctx_ptr, sr_cond_prefix + "out_layer.1.weight");
+        block.sr_cond.out_bias = get_optional_tensor(ggml_ctx_ptr, sr_cond_prefix + "out_layer.1.bias");
 
         ok &= get_required_tensor(ggml_ctx_ptr, block_prefix + "0.alpha", &block.snake_alpha);
         ok &= get_required_tensor(ggml_ctx_ptr, block_prefix + "1.weight", &block.conv_weight);
@@ -354,10 +367,16 @@ bool AudioVAE::load_from_store(const std::shared_ptr<VoxCPMWeightStore>& store) 
     if (has_latent_dim) config_.latent_dim = static_cast<int>(u32);
     const bool has_sample_rate = store->get_u32("voxcpm_audio_vae_config_sample_rate", u32);
     if (has_sample_rate) config_.sample_rate = static_cast<int>(u32);
+    const bool has_out_sample_rate = store->get_u32("voxcpm_audio_vae_config_out_sample_rate", u32);
+    if (has_out_sample_rate) config_.out_sample_rate = static_cast<int>(u32);
     const bool has_depthwise = store->get_bool("voxcpm_audio_vae_config_depthwise", config_.depthwise);
     const bool has_use_noise_block = store->get_bool("voxcpm_audio_vae_config_use_noise_block", config_.use_noise_block);
     const bool has_encoder_rates = store->get_i32_array("voxcpm_audio_vae_config_encoder_rates", config_.encoder_rates);
     const bool has_decoder_rates = store->get_i32_array("voxcpm_audio_vae_config_decoder_rates", config_.decoder_rates);
+    store->get_i32_array("voxcpm_audio_vae_config_sr_bin_boundaries", config_.sr_bin_boundaries);
+    store->get_string("voxcpm_audio_vae_config_cond_type", config_.cond_type);
+    if (store->get_u32("voxcpm_audio_vae_config_cond_dim", u32)) config_.cond_dim = static_cast<int>(u32);
+    store->get_bool("voxcpm_audio_vae_config_cond_out_layer", config_.cond_out_layer);
 
     if (!has_encoder_dim || !has_decoder_dim || !has_latent_dim || !has_sample_rate ||
         !has_encoder_rates || !has_decoder_rates) {
@@ -501,7 +520,9 @@ ggml_tensor* AudioVAE::decoder_block_forward(ggml_context* ctx,
                                              const VoxCPMBackend& backend,
                                              ggml_tensor* x,
                                              const DecoderBlockWeights& weights,
+                                             ggml_tensor* sr_bucket,
                                              int stride) const {
+    x = sample_rate_condition_forward(ctx, x, weights.sr_cond, sr_bucket);
     x = snake_activation(ctx, x, weights.snake_alpha);
     x = causal_transpose_conv1d(ctx,
                                 x,
@@ -514,6 +535,53 @@ ggml_tensor* AudioVAE::decoder_block_forward(ggml_context* ctx,
     x = residual_unit_forward(ctx, backend, x, weights.res1, 3);
     x = residual_unit_forward(ctx, backend, x, weights.res2, 9);
     return x;
+}
+
+ggml_tensor* AudioVAE::sample_rate_condition_forward(
+    ggml_context* ctx,
+    ggml_tensor* x,
+    const DecoderBlockWeights::SampleRateConditionWeights& weights,
+    ggml_tensor* sr_bucket) const {
+    if (!weights.active()) {
+        return x;
+    }
+
+    VOXCPM_ASSERT(sr_bucket != nullptr);
+    VOXCPM_ASSERT(sr_bucket->type == GGML_TYPE_I32);
+
+    ggml_tensor* conditioned = x;
+    if (config_.cond_type == "scale_bias" || config_.cond_type == "scale_bias_init") {
+        VOXCPM_ASSERT(weights.scale_embed != nullptr);
+        VOXCPM_ASSERT(weights.bias_embed != nullptr);
+        ggml_tensor* scale = ggml_get_rows(ctx, weights.scale_embed, sr_bucket);
+        ggml_tensor* bias = ggml_get_rows(ctx, weights.bias_embed, sr_bucket);
+        ggml_tensor* scale_3d = ggml_reshape_3d(ctx, scale, 1, scale->ne[0], 1);
+        ggml_tensor* bias_3d = ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1);
+        conditioned = ggml_add(ctx,
+                               ggml_mul(ctx, conditioned, ggml_repeat(ctx, scale_3d, conditioned)),
+                               ggml_repeat(ctx, bias_3d, conditioned));
+    } else if (config_.cond_type == "add") {
+        VOXCPM_ASSERT(weights.cond_embed != nullptr);
+        ggml_tensor* cond = ggml_get_rows(ctx, weights.cond_embed, sr_bucket);
+        ggml_tensor* cond_3d = ggml_reshape_3d(ctx, cond, 1, cond->ne[0], 1);
+        conditioned = ggml_add(ctx, conditioned, ggml_repeat(ctx, cond_3d, conditioned));
+    } else if (config_.cond_type == "concat") {
+        VOXCPM_ASSERT(weights.cond_embed != nullptr);
+        ggml_tensor* cond = ggml_get_rows(ctx, weights.cond_embed, sr_bucket);
+        ggml_tensor* cond_3d = ggml_reshape_3d(ctx, cond, 1, cond->ne[0], 1);
+        ggml_tensor* cond_repeat = ggml_repeat(ctx, cond_3d, ggml_new_tensor_3d(ctx, conditioned->type, conditioned->ne[0], cond->ne[0], conditioned->ne[2]));
+        conditioned = ggml_cont(ctx, ggml_concat(ctx, conditioned, cond_repeat, 1));
+    } else {
+        VOXCPM_ASSERT(false && "unsupported AudioVAE sample-rate conditioning type");
+    }
+
+    if (weights.out_weight != nullptr) {
+        VOXCPM_ASSERT(weights.out_snake_alpha != nullptr);
+        conditioned = snake_activation(ctx, conditioned, weights.out_snake_alpha);
+        conditioned = causal_conv1d(ctx, conditioned, weights.out_weight, weights.out_bias, 1, 1, 1, 0);
+    }
+
+    return conditioned;
 }
 
 ggml_tensor* AudioVAE::encode_tensor(VoxCPMContext& ctx,
@@ -548,6 +616,8 @@ ggml_tensor* AudioVAE::decode(VoxCPMContext& ctx,
                               const VoxCPMBackend& backend,
                               ggml_tensor* z) {
     depthwise_ops_.clear();
+    last_decode_sr_cond_tensor_ = nullptr;
+    last_decode_sr_bucket_ = 0;
     VOXCPM_ASSERT(z != nullptr);
     ggml_context* raw = ctx.raw_context();
 
@@ -561,8 +631,26 @@ ggml_tensor* AudioVAE::decode(VoxCPMContext& ctx,
     x = causal_conv1d_dw(raw, backend, x, weights_.decoder_model_0_weight, weights_.decoder_model_0_bias, 1, 1, 3);
     x = causal_conv1d(raw, x, weights_.decoder_model_1_weight, weights_.decoder_model_1_bias, 1, 1, 1, 0);
 
+    ggml_tensor* sr_bucket = nullptr;
+    const bool has_sr_conditioning = std::any_of(weights_.decoder_blocks.begin(),
+                                                 weights_.decoder_blocks.end(),
+                                                 [](const DecoderBlockWeights& block) {
+                                                     return block.sr_cond.active();
+                                                 });
+    if (has_sr_conditioning) {
+        last_decode_sr_bucket_ = static_cast<int32_t>(config_.sample_rate_bucket(config_.output_sample_rate()));
+        last_decode_sr_cond_tensor_ = ggml_new_tensor_1d(raw, GGML_TYPE_I32, 1);
+        ggml_set_input(last_decode_sr_cond_tensor_);
+        sr_bucket = last_decode_sr_cond_tensor_;
+    }
+
     for (int i = 0; i < config_.num_decoder_blocks(); ++i) {
-        x = decoder_block_forward(raw, backend, x, weights_.decoder_blocks[static_cast<size_t>(i)], config_.decoder_rates[static_cast<size_t>(i)]);
+        x = decoder_block_forward(raw,
+                                  backend,
+                                  x,
+                                  weights_.decoder_blocks[static_cast<size_t>(i)],
+                                  sr_bucket,
+                                  config_.decoder_rates[static_cast<size_t>(i)]);
     }
 
     x = snake_activation(raw, x, weights_.decoder_final_snake_alpha);
@@ -570,6 +658,12 @@ ggml_tensor* AudioVAE::decode(VoxCPMContext& ctx,
     x = ggml_tanh(raw, x);
     ggml_set_output(x);
     return x;
+}
+
+void AudioVAE::prepare_decode_inputs(VoxCPMBackend& backend) const {
+    if (last_decode_sr_cond_tensor_ != nullptr) {
+        backend.tensor_set(last_decode_sr_cond_tensor_, &last_decode_sr_bucket_, 0, sizeof(last_decode_sr_bucket_));
+    }
 }
 
 }  // namespace voxcpm

@@ -24,6 +24,10 @@ DecodedAudio decode_audio_from_memory(const void* data, size_t size);
 std::vector<float> convert_to_mono(const DecodedAudio& audio);
 std::vector<float> resample_audio_linear(const std::vector<float>& input, double speed);
 std::vector<float> resample_audio_to_rate(const std::vector<float>& input, int src_rate, int dst_rate);
+std::vector<float> trim_audio_silence_vad(const std::vector<float>& input,
+                                          int sample_rate,
+                                          float max_silence_ms = 200.0f,
+                                          float top_db = 35.0f);
 
 AudioResponseFormat parse_audio_response_format(const std::string& format);
 const char* audio_response_format_name(AudioResponseFormat format);

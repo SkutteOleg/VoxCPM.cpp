@@ -20,6 +20,8 @@ struct PromptFeatures {
     std::string prompt_text;
     std::vector<float> prompt_feat;
     int prompt_audio_length = 0;
+    std::vector<float> reference_feat;
+    int reference_audio_length = 0;
     int sample_rate = 0;
     int patch_size = 0;
     int feat_dim = 0;
@@ -31,6 +33,7 @@ struct VoiceMetadata {
     std::string id;
     std::string prompt_text;
     int prompt_audio_length = 0;
+    int reference_audio_length = 0;
     int sample_rate = 0;
     int patch_size = 0;
     int feat_dim = 0;
@@ -43,7 +46,10 @@ struct SynthesisRequest {
     PromptFeatures prompt;
     float cfg_value = 2.0f;
     int inference_timesteps = 10;
-    int streaming_prefix_len = 3;
+    int streaming_prefix_len = 4;
+    bool retry_badcase = false;
+    int retry_badcase_max_times = 3;
+    float retry_badcase_ratio_threshold = 6.0f;
     std::function<void(const std::vector<float>&)> chunk_callback;
 };
 
@@ -78,6 +84,9 @@ public:
                                       const std::string& prompt_text,
                                       const std::vector<float>& mono_audio,
                                       int sample_rate);
+    PromptFeatures encode_reference_audio(const std::string& id,
+                                         const std::vector<float>& mono_audio,
+                                         int sample_rate);
     SynthesisResult synthesize(const SynthesisRequest& request);
 
     int sample_rate() const;
@@ -90,6 +99,9 @@ private:
                                              const std::string& prompt_text,
                                              const std::vector<float>& mono_audio,
                                              int sample_rate);
+    PromptFeatures encode_reference_audio_locked(const std::string& id,
+                                                const std::vector<float>& mono_audio,
+                                                int sample_rate);
     SynthesisResult synthesize_locked(const SynthesisRequest& request);
 
     std::string model_path_;

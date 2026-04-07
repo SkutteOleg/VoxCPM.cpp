@@ -2,8 +2,12 @@
 
 #include "voxcpm/audio_io.h"
 #include "voxcpm/server_common.h"
+#include "test_config.h"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
+#include <vector>
 
 namespace voxcpm {
 namespace test {
@@ -37,6 +41,8 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     features.prompt_text = "hello";
     features.prompt_feat = {1.0f, 2.5f, -3.0f, 4.0f};
     features.prompt_audio_length = 2;
+    features.reference_feat = {9.0f, 8.0f, 7.0f, 6.0f};
+    features.reference_audio_length = 2;
     features.sample_rate = 16000;
     features.patch_size = 2;
     features.feat_dim = 2;
@@ -51,6 +57,8 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     REQUIRE(loaded.prompt_text == features.prompt_text);
     REQUIRE(loaded.prompt_feat == features.prompt_feat);
     REQUIRE(loaded.prompt_audio_length == features.prompt_audio_length);
+    REQUIRE(loaded.reference_feat == features.reference_feat);
+    REQUIRE(loaded.reference_audio_length == features.reference_audio_length);
     REQUIRE(loaded.sample_rate == features.sample_rate);
     REQUIRE(loaded.patch_size == features.patch_size);
     REQUIRE(loaded.feat_dim == features.feat_dim);
@@ -58,10 +66,72 @@ TEST_CASE("VoiceStore persists manifest and prompt features round-trip", "[serve
     const VoiceMetadata metadata = store.load_metadata(features.id);
     REQUIRE(metadata.id == features.id);
     REQUIRE(metadata.prompt_text == features.prompt_text);
+    REQUIRE(metadata.reference_audio_length == features.reference_audio_length);
 
     store.delete_voice(features.id);
     REQUIRE_FALSE(store.has_voice(features.id));
     std::filesystem::remove_all(root);
+}
+
+TEST_CASE("Service synthesize runs end-to-end with encoded prompt audio", "[server][integration]") {
+    const std::string model_path = get_model_path();
+    REQUIRE(std::filesystem::exists(model_path));
+
+    VoxCPMServiceCore service(model_path, BackendType::CPU, 2);
+    service.load();
+    REQUIRE(service.loaded());
+
+    constexpr int kInputSampleRate = 16000;
+    constexpr float kPi = 3.14159265358979323846f;
+    std::vector<float> mono_audio(1600, 0.0f);
+    for (size_t i = 0; i < mono_audio.size(); ++i) {
+        const float phase = 2.0f * kPi * 220.0f * static_cast<float>(i) / static_cast<float>(kInputSampleRate);
+        mono_audio[i] = 0.05f * std::sin(phase);
+    }
+
+    PromptFeatures prompt = service.encode_prompt_audio("voice_test", "你好", mono_audio, kInputSampleRate);
+    REQUIRE(prompt.prompt_audio_length > 0);
+    REQUIRE(prompt.sample_rate > 0);
+    REQUIRE(prompt.patch_size == service.patch_size());
+    REQUIRE(prompt.feat_dim == service.feat_dim());
+    REQUIRE(prompt.prompt_feat.size() ==
+            static_cast<size_t>(prompt.prompt_audio_length * prompt.patch_size * prompt.feat_dim));
+
+    PromptFeatures reference = service.encode_reference_audio("voice_ref", mono_audio, kInputSampleRate);
+    REQUIRE(reference.reference_audio_length > 0);
+    REQUIRE(reference.prompt_audio_length == 0);
+    REQUIRE(reference.prompt_text.empty());
+    REQUIRE(reference.sample_rate == prompt.sample_rate);
+    REQUIRE(reference.patch_size == service.patch_size());
+    REQUIRE(reference.feat_dim == service.feat_dim());
+    REQUIRE(reference.reference_feat.size() ==
+            static_cast<size_t>(reference.reference_audio_length * reference.patch_size * reference.feat_dim));
+
+    prompt.reference_feat = reference.reference_feat;
+    prompt.reference_audio_length = reference.reference_audio_length;
+
+    int chunk_count = 0;
+    size_t last_chunk_size = 0;
+    SynthesisRequest request;
+    request.text = "测试";
+    request.prompt = prompt;
+    request.cfg_value = 1.5f;
+    request.inference_timesteps = 4;
+    request.streaming_prefix_len = 2;
+    request.chunk_callback = [&](const std::vector<float>& chunk) {
+        ++chunk_count;
+        last_chunk_size = chunk.size();
+    };
+
+    const SynthesisResult result = service.synthesize(request);
+    REQUIRE(result.sample_rate == service.sample_rate());
+    REQUIRE(result.generated_frames > 0);
+    REQUIRE_FALSE(result.waveform.empty());
+    REQUIRE(std::all_of(result.waveform.begin(), result.waveform.end(), [](float value) {
+        return std::isfinite(value);
+    }));
+    REQUIRE(chunk_count > 0);
+    REQUIRE(last_chunk_size > 0);
 }
 
 }  // namespace test

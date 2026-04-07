@@ -10,6 +10,7 @@
  *   - enc_to_lm_proj: LocEnc output -> LM input
  *   - lm_to_dit_proj: LM output -> DiT input
  *   - res_to_dit_proj: ResidualLM output -> DiT input
+ *   - fusion_concat_proj: VoxCPM2 residual fusion bridge
  * - StopTokenPredictor: Binary classification for stop/continue
  * - Embedding: Token embedding lookup with optional scale
  *
@@ -43,6 +44,7 @@ class VoxCPMWeightStore;
  * - proj.enc_to_lm.weight / proj.enc_to_lm.bias
  * - proj.lm_to_dit.weight / proj.lm_to_dit.bias
  * - proj.res_to_dit.weight / proj.res_to_dit.bias
+ * - proj.fusion_concat.weight / proj.fusion_concat.bias (optional, VoxCPM2)
  *
  * Weight shape in GGML: [in_dim, out_dim]
  */
@@ -105,7 +107,7 @@ public:
      * @param input Input tensor [in_dim, ...]
      * @return Output tensor [out_dim, ...]
      */
-    ggml_tensor* forward(VoxCPMContext& ctx, ggml_tensor* input);
+    ggml_tensor* forward(VoxCPMContext& ctx, ggml_tensor* input) const;
 
     // =========================================================================
     // Configuration
@@ -200,7 +202,7 @@ public:
      * @param input Input tensor [hidden_dim, B]
      * @return Logits tensor [num_classes, B]
      */
-    ggml_tensor* forward(VoxCPMContext& ctx, ggml_tensor* input);
+    ggml_tensor* forward(VoxCPMContext& ctx, ggml_tensor* input) const;
 
     // =========================================================================
     // Configuration
@@ -352,11 +354,13 @@ public:
     LinearProjection* enc_to_lm_proj() { return enc_to_lm_proj_.get(); }
     LinearProjection* lm_to_dit_proj() { return lm_to_dit_proj_.get(); }
     LinearProjection* res_to_dit_proj() { return res_to_dit_proj_.get(); }
+    LinearProjection* fusion_concat_proj() { return fusion_concat_proj_.get(); }
     StopTokenPredictor* stop_token() { return stop_token_.get(); }
     Embedding* embed_tokens() { return embed_tokens_.get(); }
     const LinearProjection* enc_to_lm_proj() const { return enc_to_lm_proj_.get(); }
     const LinearProjection* lm_to_dit_proj() const { return lm_to_dit_proj_.get(); }
     const LinearProjection* res_to_dit_proj() const { return res_to_dit_proj_.get(); }
+    const LinearProjection* fusion_concat_proj() const { return fusion_concat_proj_.get(); }
     const StopTokenPredictor* stop_token() const { return stop_token_.get(); }
     const Embedding* embed_tokens() const { return embed_tokens_.get(); }
 
@@ -396,6 +400,7 @@ private:
     std::unique_ptr<LinearProjection> enc_to_lm_proj_;
     std::unique_ptr<LinearProjection> lm_to_dit_proj_;
     std::unique_ptr<LinearProjection> res_to_dit_proj_;
+    std::unique_ptr<LinearProjection> fusion_concat_proj_;
     std::unique_ptr<StopTokenPredictor> stop_token_;
     std::unique_ptr<Embedding> embed_tokens_;
     std::shared_ptr<VoxCPMWeightStore> shared_store_;

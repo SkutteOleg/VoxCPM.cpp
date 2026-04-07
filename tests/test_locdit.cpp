@@ -199,51 +199,54 @@ TEST_CASE("LocDiT forward builds for batch one and two", "[locdit][integration]"
 
     VoxCPMBackend backend(BackendType::CPU, 2);
     VoxCPMContext weight_ctx(ContextType::Weights, 256);
-    VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
 
     LocDiTModel locdit;
-    REQUIRE(locdit.load_from_gguf(kModelPath, weight_ctx, graph_ctx, backend));
+    VoxCPMContext load_graph_ctx(ContextType::Graph, 32768, 262144);
+    REQUIRE(locdit.load_from_gguf(kModelPath, weight_ctx, load_graph_ctx, backend));
 
     for (int batch : {1, 2}) {
-        ggml_tensor* x = graph_ctx.new_tensor_3d(GGML_TYPE_F32, locdit.feat_dim(), 4, batch);
-        ggml_tensor* mu = graph_ctx.new_tensor_2d(GGML_TYPE_F32, locdit.config().hidden_size, batch);
-        ggml_tensor* t = graph_ctx.new_tensor_1d(GGML_TYPE_F32, batch);
-        ggml_tensor* cond = graph_ctx.new_tensor_3d(GGML_TYPE_F32, locdit.feat_dim(), 4, batch);
-        ggml_tensor* dt = graph_ctx.new_tensor_1d(GGML_TYPE_F32, batch);
+        for (int mu_tokens : {1, 2}) {
+            VoxCPMContext graph_ctx(ContextType::Graph, 65536, 524288);
+            ggml_tensor* x = graph_ctx.new_tensor_3d(GGML_TYPE_F32, locdit.feat_dim(), 4, batch);
+            ggml_tensor* mu = graph_ctx.new_tensor_2d(GGML_TYPE_F32, locdit.config().hidden_size * mu_tokens, batch);
+            ggml_tensor* t = graph_ctx.new_tensor_1d(GGML_TYPE_F32, batch);
+            ggml_tensor* cond = graph_ctx.new_tensor_3d(GGML_TYPE_F32, locdit.feat_dim(), 4, batch);
+            ggml_tensor* dt = graph_ctx.new_tensor_1d(GGML_TYPE_F32, batch);
 
-        ggml_set_input(x);
-        ggml_set_input(mu);
-        ggml_set_input(t);
-        ggml_set_input(cond);
-        ggml_set_input(dt);
+            ggml_set_input(x);
+            ggml_set_input(mu);
+            ggml_set_input(t);
+            ggml_set_input(cond);
+            ggml_set_input(dt);
 
-        ggml_tensor* output = locdit.forward(graph_ctx, x, mu, t, cond, dt);
-        REQUIRE(output != nullptr);
-        REQUIRE(output->ne[0] == locdit.feat_dim());
-        REQUIRE(output->ne[1] == 4);
-        REQUIRE(output->ne[2] == batch);
-        ggml_set_output(output);
+            ggml_tensor* output = locdit.forward(graph_ctx, x, mu, t, cond, dt);
+            REQUIRE(output != nullptr);
+            REQUIRE(output->ne[0] == locdit.feat_dim());
+            REQUIRE(output->ne[1] == 4);
+            REQUIRE(output->ne[2] == batch);
+            ggml_set_output(output);
 
-        ggml_cgraph* graph = graph_ctx.new_graph();
-        REQUIRE(graph != nullptr);
-        graph_ctx.build_forward(graph, output);
-        backend.alloc_graph(graph);
+            ggml_cgraph* graph = graph_ctx.new_graph();
+            REQUIRE(graph != nullptr);
+            graph_ctx.build_forward(graph, output);
+            backend.alloc_graph(graph);
 
-        std::vector<float> x_data(static_cast<size_t>(locdit.feat_dim()) * 4 * batch, 0.0f);
-        std::vector<float> mu_data(static_cast<size_t>(locdit.config().hidden_size) * batch, 0.0f);
-        std::vector<float> t_data(static_cast<size_t>(batch), 0.0f);
-        std::vector<float> cond_data(static_cast<size_t>(locdit.feat_dim()) * 4 * batch, 0.0f);
-        std::vector<float> dt_data(static_cast<size_t>(batch), 0.0f);
-        std::vector<float> actual(static_cast<size_t>(locdit.feat_dim()) * 4 * batch, 0.0f);
+            std::vector<float> x_data(static_cast<size_t>(locdit.feat_dim()) * 4 * batch, 0.0f);
+            std::vector<float> mu_data(static_cast<size_t>(locdit.config().hidden_size * mu_tokens) * batch, 0.0f);
+            std::vector<float> t_data(static_cast<size_t>(batch), 0.0f);
+            std::vector<float> cond_data(static_cast<size_t>(locdit.feat_dim()) * 4 * batch, 0.0f);
+            std::vector<float> dt_data(static_cast<size_t>(batch), 0.0f);
+            std::vector<float> actual(static_cast<size_t>(locdit.feat_dim()) * 4 * batch, 0.0f);
 
-        backend.tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
-        backend.tensor_set(mu, mu_data.data(), 0, mu_data.size() * sizeof(float));
-        backend.tensor_set(t, t_data.data(), 0, t_data.size() * sizeof(float));
-        backend.tensor_set(cond, cond_data.data(), 0, cond_data.size() * sizeof(float));
-        backend.tensor_set(dt, dt_data.data(), 0, dt_data.size() * sizeof(float));
+            backend.tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
+            backend.tensor_set(mu, mu_data.data(), 0, mu_data.size() * sizeof(float));
+            backend.tensor_set(t, t_data.data(), 0, t_data.size() * sizeof(float));
+            backend.tensor_set(cond, cond_data.data(), 0, cond_data.size() * sizeof(float));
+            backend.tensor_set(dt, dt_data.data(), 0, dt_data.size() * sizeof(float));
 
-        REQUIRE(backend.compute(graph) == GGML_STATUS_SUCCESS);
-        backend.tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+            REQUIRE(backend.compute(graph) == GGML_STATUS_SUCCESS);
+            backend.tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+        }
     }
 }
 

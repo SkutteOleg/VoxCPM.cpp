@@ -316,6 +316,7 @@ bool MiniCPMModel::update_config_from_gguf(gguf_context* gguf_ctx, const std::st
     if (get_u32_kv(gguf_ctx, "llama.context_length", u32)) config_.max_length = static_cast<int>(u32);
     if (get_u32_kv(gguf_ctx, "voxcpm_lm_config_scale_emb", u32)) config_.scale_emb = static_cast<int>(u32);
     if (get_u32_kv(gguf_ctx, "voxcpm_lm_config_dim_model_base", u32)) config_.dim_model_base = static_cast<int>(u32);
+    if (get_u32_kv(gguf_ctx, "voxcpm_lm_config_kv_channels", u32)) config_.kv_channels = static_cast<int>(u32);
     if (get_u32_kv(gguf_ctx, "voxcpm_lm_config_use_mup", u32)) config_.use_mup = (u32 != 0);
     if (get_u32_kv(gguf_ctx, "voxcpm_lm_config_rope_scaling_original_max_position_embeddings", u32)) {
         config_.rope_original_max = static_cast<int>(u32);
@@ -349,6 +350,9 @@ bool MiniCPMModel::update_config_from_gguf(gguf_context* gguf_ctx, const std::st
         if (has_variant_config) {
             config_.n_layer = static_cast<int>(u32);
         }
+        if (get_u32_kv(gguf_ctx, "voxcpm_residual_lm_no_rope", u32)) {
+            config_.no_rope = (u32 != 0);
+        }
     } else if (prefix == "locenc.") {
         const bool has_hidden = get_u32_kv(gguf_ctx, "voxcpm_encoder_config_hidden_dim", u32);
         if (has_hidden) config_.hidden_size = static_cast<int>(u32);
@@ -356,6 +360,7 @@ bool MiniCPMModel::update_config_from_gguf(gguf_context* gguf_ctx, const std::st
         if (has_intermediate) config_.intermediate_size = static_cast<int>(u32);
         const bool has_heads = get_u32_kv(gguf_ctx, "voxcpm_encoder_config_num_heads", u32);
         if (has_heads) config_.n_heads = static_cast<int>(u32);
+        if (get_u32_kv(gguf_ctx, "voxcpm_encoder_config_kv_channels", u32)) config_.kv_channels = static_cast<int>(u32);
         const bool has_layers = get_u32_kv(gguf_ctx, "voxcpm_encoder_config_num_layers", u32);
         if (has_layers) config_.n_layer = static_cast<int>(u32);
         has_variant_config = has_hidden && has_intermediate && has_heads && has_layers;
@@ -366,6 +371,7 @@ bool MiniCPMModel::update_config_from_gguf(gguf_context* gguf_ctx, const std::st
         if (has_intermediate) config_.intermediate_size = static_cast<int>(u32);
         const bool has_heads = get_u32_kv(gguf_ctx, "voxcpm_dit_config_num_heads", u32);
         if (has_heads) config_.n_heads = static_cast<int>(u32);
+        if (get_u32_kv(gguf_ctx, "voxcpm_dit_config_kv_channels", u32)) config_.kv_channels = static_cast<int>(u32);
         const bool has_layers = get_u32_kv(gguf_ctx, "voxcpm_dit_config_num_layers", u32);
         if (has_layers) config_.n_layer = static_cast<int>(u32);
         has_variant_config = has_hidden && has_intermediate && has_heads && has_layers;
@@ -566,6 +572,26 @@ bool MiniCPMModel::load_from_store(const std::shared_ptr<VoxCPMWeightStore>& sto
         ok &= get_required(layer_tensor_name(prefix_norm, i, "ffn_down.weight"), &lw.down_proj);
     }
 
+    if (ok && !weights_.layers.empty()) {
+        const MiniCPMLayerWeights& first = weights_.layers.front();
+        const int q_rows = static_cast<int>(first.q_proj->ne[1]);
+        const int k_rows = static_cast<int>(first.k_proj->ne[1]);
+        const int v_rows = static_cast<int>(first.v_proj->ne[1]);
+        const bool valid_q = config_.n_heads > 0 && q_rows % config_.n_heads == 0;
+        const bool valid_k = config_.n_kv_heads > 0 && k_rows % config_.n_kv_heads == 0;
+        const bool valid_v = config_.n_kv_heads > 0 && v_rows % config_.n_kv_heads == 0;
+        if (!valid_q || !valid_k || !valid_v) {
+            return false;
+        }
+        const int inferred_q_head_dim = q_rows / config_.n_heads;
+        const int inferred_k_head_dim = k_rows / config_.n_kv_heads;
+        const int inferred_v_head_dim = v_rows / config_.n_kv_heads;
+        if (inferred_q_head_dim != inferred_k_head_dim || inferred_q_head_dim != inferred_v_head_dim) {
+            return false;
+        }
+        config_.kv_channels = inferred_q_head_dim;
+    }
+
     return ok && init_aux_tensors(backend) && init_fused_projection_tensors(backend, prefix_norm);
 }
 
@@ -583,6 +609,10 @@ ggml_tensor* MiniCPMModel::apply_rope(ggml_context* ctx,
                                       ggml_tensor* x,
                                       ggml_tensor* positions,
                                       int seq_len) const {
+    if (config_.no_rope) {
+        return x;
+    }
+
     const ggml_tensor* freq_factors = seq_len > config_.rope_original_max
         ? rope_long_factor_
         : rope_short_factor_;

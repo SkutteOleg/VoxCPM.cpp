@@ -79,6 +79,10 @@ bool is_float_tensor_type(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 }
 
+bool should_passthrough_tensor_type(ggml_type type) {
+    return !is_float_tensor_type(type) && !ggml_is_quantized(type);
+}
+
 ggml_type quantize_base_type(ggml_ftype type);
 
 bool is_supported_output_type(ggml_ftype type) {
@@ -928,20 +932,22 @@ bool quantize_gguf(const QuantizeOptions& options, QuantizeStats* stats) {
         }
 
         fill_stats_for_input_tensor(tensor, &local_stats);
-
-        if (!is_float_tensor_type(tensor->type)) {
+        const std::string name(tensor_name);
+        const bool passthrough_type = should_passthrough_tensor_type(tensor->type);
+        if (!passthrough_type && !is_float_tensor_type(tensor->type)) {
             throw Error(
                 ErrorCode::InvalidArgument,
-                "quantize_gguf only accepts floating-point input tensors; found " +
+                "quantize_gguf only accepts floating-point input tensors or passthrough integer metadata; found " +
                     std::string(ggml_type_name_safe(tensor->type)) + " in " + tensor_name);
         }
-
-        const std::string name(tensor_name);
-        const ggml_type desired_type = choose_target_type(tensor, name, options.file_type, options, plan);
+        const ggml_type desired_type =
+            passthrough_type ? tensor->type : choose_target_type(tensor, name, options.file_type, options, plan);
         ggml_type output_type = desired_type;
-        TensorLayout output_layout = choose_output_layout(tensor, name, output_type);
+        TensorLayout output_layout =
+            passthrough_type ? make_tensor_layout(tensor) : choose_output_layout(tensor, name, output_type);
         bool shape_preserved = false;
-        if (output_type != tensor->type && !tensor_can_change_type(tensor, name, output_type, output_layout)) {
+        if (!passthrough_type && output_type != tensor->type &&
+            !tensor_can_change_type(tensor, name, output_type, output_layout)) {
             if (is_audio_vae_regular_conv_weight(tensor, name) && ggml_is_quantized(output_type)) {
                 output_type = GGML_TYPE_F16;
                 output_layout = choose_output_layout(tensor, name, output_type);
@@ -951,7 +957,8 @@ bool quantize_gguf(const QuantizeOptions& options, QuantizeStats* stats) {
                 output_layout = make_tensor_layout(tensor);
             }
         }
-        const bool policy_preserved = desired_type == tensor->type && should_preserve_tensor(tensor, name);
+        const bool policy_preserved =
+            passthrough_type || (desired_type == tensor->type && should_preserve_tensor(tensor, name));
         const bool quantized = output_type != tensor->type;
 
         const ggml_tensor output_tensor = make_output_tensor_metadata(tensor, output_type, output_layout);

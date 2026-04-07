@@ -53,7 +53,7 @@ public:
                          VoxCPMBackend& backend);
 
     // x / cond / output: [feat_dim, seq_len, batch]
-    // mu: [hidden_size, batch]
+    // mu: [hidden_size * n_mu_tokens, batch]
     // t / dt: [batch]
     ggml_tensor* forward(VoxCPMContext& ctx,
                          ggml_tensor* x,
@@ -97,23 +97,24 @@ private:
     ggml_tensor* compute_delta_time_embedding(VoxCPMContext& ctx, ggml_tensor* dt_scalar) const;
     ggml_tensor* project_input(VoxCPMContext& ctx, ggml_tensor* x) const;
     ggml_tensor* project_condition(VoxCPMContext& ctx, ggml_tensor* cond) const;
-    ggml_tensor* build_combined_token(VoxCPMContext& ctx,
-                                      ggml_tensor* mu,
-                                      ggml_tensor* t_scalar,
-                                      ggml_tensor* dt_scalar) const;
+    ggml_tensor* build_time_token(VoxCPMContext& ctx,
+                                  ggml_tensor* t_scalar,
+                                  ggml_tensor* dt_scalar) const;
+    ggml_tensor* reshape_mu_tokens(VoxCPMContext& ctx, ggml_tensor* mu) const;
     ggml_tensor* build_cfg_pair_positions(VoxCPMContext& ctx, int branch_len) const;
     ggml_tensor* build_cfg_pair_attention_mask(VoxCPMContext& ctx, int branch_len) const;
     bool ensure_cfg_pair_constants(int branch_len);
     ggml_tensor* forward_projected(VoxCPMContext& ctx,
                                    ggml_tensor* x_proj,
-                                   ggml_tensor* combined_token,
+                                   ggml_tensor* prefix_tokens,
                                    ggml_tensor* cond_proj,
+                                   int generated_prefix_tokens,
                                    int prefix_len,
                                    int seq_len);
     void forward_cfg_pair_projected(VoxCPMContext& ctx,
                                     ggml_tensor* x_proj,
                                     ggml_tensor* mu,
-                                    ggml_tensor* combined_base,
+                                    ggml_tensor* time_token,
                                     ggml_tensor* cond_proj,
                                     int prefix_len,
                                     ggml_tensor** conditioned,

@@ -28,6 +28,7 @@ struct SampleModelData {
     std::vector<float> audio_vae_transpose_conv;
     std::vector<float> audio_vae_bias;
     std::vector<float> audio_vae_alpha;
+    std::vector<int32_t> audio_vae_sr_bin_boundaries;
     std::vector<float> locenc_special_token;
     std::vector<float> blk0_attn_norm;
 };
@@ -107,6 +108,7 @@ void write_sample_quantize_model(const std::filesystem::path& path, SampleModelD
     sample->audio_vae_transpose_conv.resize(4 * 2 * 4);
     sample->audio_vae_bias.resize(2);
     sample->audio_vae_alpha.resize(2);
+    sample->audio_vae_sr_bin_boundaries = {20000, 30000, 40000};
     sample->locenc_special_token.resize(256);
     sample->blk0_attn_norm.resize(256);
 
@@ -199,6 +201,13 @@ void write_sample_quantize_model(const std::filesystem::path& path, SampleModelD
     ggml_set_name(audio_vae_alpha, "audio_vae.decoder.model.2.block.0.alpha");
     std::memcpy(audio_vae_alpha->data, sample->audio_vae_alpha.data(), sample->audio_vae_alpha.size() * sizeof(float));
 
+    ggml_tensor* audio_vae_sr_bin_boundaries = ggml_new_tensor_1d(
+        tensor_ctx, GGML_TYPE_I32, static_cast<int64_t>(sample->audio_vae_sr_bin_boundaries.size()));
+    ggml_set_name(audio_vae_sr_bin_boundaries, "audio_vae.decoder.sr_bin_boundaries");
+    std::memcpy(audio_vae_sr_bin_boundaries->data,
+                sample->audio_vae_sr_bin_boundaries.data(),
+                sample->audio_vae_sr_bin_boundaries.size() * sizeof(int32_t));
+
     ggml_tensor* locenc_special_token = ggml_new_tensor_1d(tensor_ctx, GGML_TYPE_F32, 256);
     ggml_set_name(locenc_special_token, "locenc.special_token");
     std::memcpy(
@@ -231,6 +240,7 @@ void write_sample_quantize_model(const std::filesystem::path& path, SampleModelD
     gguf_add_tensor(gguf_ctx, audio_vae_transpose_conv);
     gguf_add_tensor(gguf_ctx, audio_vae_bias);
     gguf_add_tensor(gguf_ctx, audio_vae_alpha);
+    gguf_add_tensor(gguf_ctx, audio_vae_sr_bin_boundaries);
     gguf_add_tensor(gguf_ctx, locenc_special_token);
     gguf_add_tensor(gguf_ctx, blk0_attn_norm);
 
@@ -264,12 +274,12 @@ TEST_CASE("quantize_gguf applies VoxCPM tensor mapping policy", "[quantize]") {
     QuantizeStats stats;
     REQUIRE(quantize_gguf(options, &stats));
 
-    REQUIRE(stats.total_tensors == 14);
+    REQUIRE(stats.total_tensors == 15);
     REQUIRE(stats.quantized_tensors == 10);
-    REQUIRE(stats.audio_vae_tensors == 7);
+    REQUIRE(stats.audio_vae_tensors == 8);
     REQUIRE(stats.audio_vae_quantized_tensors == 1);
     REQUIRE(stats.audio_vae_f16_tensors == 4);
-    REQUIRE(stats.audio_vae_preserved_tensors == 2);
+    REQUIRE(stats.audio_vae_preserved_tensors == 3);
 
     VoxCPMBackend backend(BackendType::CPU, 2);
     VoxCPMWeightStore store;
@@ -301,6 +311,7 @@ TEST_CASE("quantize_gguf applies VoxCPM tensor mapping policy", "[quantize]") {
     REQUIRE(store.get_tensor("audio_vae.decoder.model.2.block.1.weight")->type == GGML_TYPE_F16);
     REQUIRE(store.get_tensor("audio_vae.encoder.block.0.bias")->type == GGML_TYPE_F32);
     REQUIRE(store.get_tensor("audio_vae.decoder.model.2.block.0.alpha")->type == GGML_TYPE_F32);
+    REQUIRE(store.get_tensor("audio_vae.decoder.sr_bin_boundaries")->type == GGML_TYPE_I32);
     REQUIRE(store.get_tensor("locenc.special_token")->type == GGML_TYPE_F32);
     REQUIRE(store.get_tensor("blk.0.attn_norm.weight")->type == GGML_TYPE_F32);
 
@@ -310,6 +321,10 @@ TEST_CASE("quantize_gguf applies VoxCPM tensor mapping policy", "[quantize]") {
     const std::vector<uint8_t> special_token_bytes = tensor_bytes(store.get_tensor("locenc.special_token"));
     REQUIRE(special_token_bytes.size() == sample.locenc_special_token.size() * sizeof(float));
     REQUIRE(std::memcmp(special_token_bytes.data(), sample.locenc_special_token.data(), special_token_bytes.size()) == 0);
+
+    const std::vector<uint8_t> sr_bin_bytes = tensor_bytes(store.get_tensor("audio_vae.decoder.sr_bin_boundaries"));
+    REQUIRE(sr_bin_bytes.size() == sample.audio_vae_sr_bin_boundaries.size() * sizeof(int32_t));
+    REQUIRE(std::memcmp(sr_bin_bytes.data(), sample.audio_vae_sr_bin_boundaries.data(), sr_bin_bytes.size()) == 0);
 
     std::filesystem::remove(input_path);
     std::filesystem::remove(output_path);
@@ -332,10 +347,10 @@ TEST_CASE("quantize_gguf supports forcing AudioVAE weights to F16", "[quantize]"
     QuantizeStats stats;
     REQUIRE(quantize_gguf(options, &stats));
 
-    REQUIRE(stats.audio_vae_tensors == 7);
+    REQUIRE(stats.audio_vae_tensors == 8);
     REQUIRE(stats.audio_vae_quantized_tensors == 0);
     REQUIRE(stats.audio_vae_f16_tensors == 5);
-    REQUIRE(stats.audio_vae_preserved_tensors == 2);
+    REQUIRE(stats.audio_vae_preserved_tensors == 3);
 
     VoxCPMBackend backend(BackendType::CPU, 2);
     VoxCPMWeightStore store;
@@ -364,6 +379,10 @@ TEST_CASE("quantize_gguf supports forcing AudioVAE weights to F16", "[quantize]"
     const ggml_tensor* decoder_alpha = store.get_tensor("audio_vae.decoder.model.2.block.0.alpha");
     REQUIRE(decoder_alpha != nullptr);
     REQUIRE(decoder_alpha->type == GGML_TYPE_F32);
+
+    const ggml_tensor* sr_bin_boundaries = store.get_tensor("audio_vae.decoder.sr_bin_boundaries");
+    REQUIRE(sr_bin_boundaries != nullptr);
+    REQUIRE(sr_bin_boundaries->type == GGML_TYPE_I32);
 
     std::filesystem::remove(input_path);
     std::filesystem::remove(output_path);
