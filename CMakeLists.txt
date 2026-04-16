@@ -6,7 +6,7 @@ project(voxcpm
     LANGUAGES CXX C
 )
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -16,9 +16,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Compiler flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+if(NOT MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -51,16 +55,13 @@ set(GGML_CUDA ${VOXCPM_CUDA} CACHE BOOL "ggml: use CUDA" FORCE)
 set(GGML_NATIVE ${VOXCPM_NATIVE} CACHE BOOL "ggml: optimize the build for the current system" FORCE)
 add_subdirectory(${GGML_DIR} ggml)
 
-# nlohmann_json is only required for tests / trace tooling.
-if(VOXCPM_BUILD_TESTS)
-    set(JSON_DIR ${CMAKE_SOURCE_DIR}/third_party/json)
-    if(EXISTS ${JSON_DIR}/CMakeLists.txt)
-        add_subdirectory(${JSON_DIR} json)
-    else()
-        include(FetchContent)
-        FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
-        FetchContent_MakeAvailable(json)
-    endif()
+set(JSON_DIR ${CMAKE_SOURCE_DIR}/third_party/json)
+if(EXISTS ${JSON_DIR}/CMakeLists.txt)
+    add_subdirectory(${JSON_DIR} json)
+else()
+    include(FetchContent)
+    FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+    FetchContent_MakeAvailable(json)
 endif()
 
 # =============================================================================
@@ -100,6 +101,7 @@ target_include_directories(voxcpm
         ${GGML_DIR}/src
         ${CMAKE_SOURCE_DIR}/third_party/miniaudio
         ${CMAKE_SOURCE_DIR}/third_party/json/include
+        ${json_SOURCE_DIR}/include
 )
 
 target_link_libraries(voxcpm

@@ -13,5 +13,6 @@ add_executable(voxcpm-server ../servers/voxcpm_server.cpp)
 target_include_directories(voxcpm-server PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/cpp-httplib
     ${CMAKE_SOURCE_DIR}/third_party/json/include
+    ${json_SOURCE_DIR}/include
 )
 target_link_libraries(voxcpm-server PRIVATE voxcpm Threads::Threads)

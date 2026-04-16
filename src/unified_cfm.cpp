@@ -6,7 +6,12 @@
 #include "voxcpm/unified_cfm.h"
 
 #include <algorithm>
+#define _USE_MATH_DEFINES
 #include <cmath>
+
+#ifndef M_PI_2
+    #define M_PI_2 1.57079632679489661923
+#endif
 
 namespace voxcpm {
 
