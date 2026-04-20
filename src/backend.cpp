@@ -602,6 +602,14 @@ void VoxCPMBackend::tensor_set(ggml_tensor* tensor, const void* data, size_t off
             << ", size=" << size;
         throw Error(ErrorCode::BackendError, oss.str());
     }
+    if (tensor->buffer == nullptr || tensor->data == nullptr) {
+        std::ostringstream oss;
+        oss << "tensor_set target is not allocated for tensor '" << tensor->name
+            << "': buffer=" << tensor->buffer
+            << ", data=" << tensor->data
+            << ", tensor_bytes=" << tensor_bytes;
+        throw Error(ErrorCode::BackendError, oss.str());
+    }
 
     const auto start = std::chrono::steady_clock::now();
     ggml_backend_tensor_set(tensor, data, offset, size);

@@ -2342,6 +2342,7 @@ VoxCPMDecodeState VoxCPMRuntime::prefill_impl(const std::vector<int32_t>& text,
                                                            state.persistent_state->lm_hidden(),
                                                            state.persistent_state->residual_hidden());
                 backend_->free_buffer(combined_buffer);
+                reset_request_state();
             }
             if (!persistent_only_prefill) {
                 lm_hidden.resize(static_cast<size_t>(base_lm_.config().hidden_size));

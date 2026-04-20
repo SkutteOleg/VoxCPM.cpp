@@ -530,6 +530,7 @@ enum class BufferUsage {
 - `2026-04-19`: OpenAI-compatible `voxcpm-server` 已新增 `--output-sample-rate`，并把 `wav/mp3/opus/pcm` 的最终输出统一改为先按该采样率重采样后再编码；README / README.cuda / README_zh 已补充 24 kHz PCM 的服务端注意事项。
 - `2026-04-20`: 已把长文本 sequence graph 的 `ggml_context(no_alloc=true)` metadata headroom 改为随 `seq_len` 增长，并修复 VoxCPM2 中原始 `LocEnc` hidden 按 `BaseLM` hidden 回读的问题；`MiniCPM` integration 测试新增 attention 投影 shape 契约，锁定 `kv_channels=128` 不再退回 reshape 断言。
 - `2026-04-20`: GPU 最终 `AudioVAE decode` 的 chunk fallback 已改为按 `AudioVAE` 配置触发；对带 `sr_cond` / 更深 decoder 的 VoxCPM2 提前切到 chunk decode，避免在约 `1688` latent patches 时继续走整图解码而撞上 `ggml-cuda cpy` 的 transpose grid 断言。
+- `2026-04-20`: 长文本 chunked prefill 现在会在每个 chunk 完成后清理 runtime cached graph handles，避免下一块 prefill 复用在共享 compute arena 重新分配后已经悬挂的 input tensor 指针；VoxCPM2 `seq_len=833` 的 CUDA CLI 复现已从第二块 `tensor_set` 崩溃恢复为可完整跑通。
 - `2026-04-18`: service 长文本请求已补 seq-aware graph context 与 chunked prefill fallback；CUDA service decode budget 固定为 `<=256/128 step`, `257-512/96 step`, `>512/64 step`，并在 `README.cuda.md` 记录。
 - `2026-04-03`: eager `prefill` 的 `residual_hidden` 已改成先 direct publish 到 `persistent_state`、再按需回填 host shadow；现有 eager/lazy transfer 测试已更新为锁定两条路径的 `h2d` 完全收敛，只剩 eager 为 host shadow 多付出的 `d2h`。
 - `2026-04-03`: eager `prefill` 的 `lm_hidden` 已改成 direct publish base last hidden 到 `persistent_state`、再按需回填 host shadow；现有 eager/lazy transfer 测试已进一步更新为锁定 eager 相对 lazy 的额外 `d2h` 至少覆盖 `lm_hidden + residual_hidden`。
