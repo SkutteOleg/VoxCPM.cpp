@@ -353,6 +353,22 @@ void fill_noise(std::vector<float>& noise, int patch_size, int feat_dim, std::mt
     }
 }
 
+int decode_step_cap_for_service(BackendType backend_type, int seq_len) {
+    constexpr int kShortSeqThreshold = 256;
+    constexpr int kLongSeqThreshold = 512;
+
+    if (backend_type == BackendType::CPU) {
+        return seq_len > kLongSeqThreshold ? 32 : (seq_len > kShortSeqThreshold ? 48 : 64);
+    }
+    return seq_len > kLongSeqThreshold ? 64 : (seq_len > kShortSeqThreshold ? 96 : 128);
+}
+
+bool should_use_output_pool_timeline(const VoxCPMDecodeState& state, bool has_reference_audio, int seq_len) {
+    constexpr int kOutputPoolSeqLimit = 256;
+    return state.output_pool != nullptr && state.output_pool->is_initialized() && !has_reference_audio &&
+           seq_len <= kOutputPoolSeqLimit;
+}
+
 std::vector<float> build_decode_latent_sequence(const std::vector<float>& prompt_feat,
                                                 int prompt_audio_length,
                                                 const std::vector<float>& generated_steps,
@@ -410,6 +426,17 @@ void append_stream_frame(std::vector<float>& recent_frames,
         recent_frames.erase(recent_frames.begin(),
                             recent_frames.begin() + static_cast<std::ptrdiff_t>(recent_frames.size() - max_elems));
     }
+}
+
+void clear_decode_graph_caches_after_streaming_audio_decode(VoxCPMRuntime& runtime,
+                                                            VoxCPMDecodeState& state) {
+    // Streaming AudioVAE chunk decode can resize the shared compute arena.
+    // Drop cached graph handles before the next decode step can reuse stale tensor data pointers.
+    runtime.reset_request_state();
+    state.base_lm_step_graph.clear();
+    state.residual_lm_step_graph.clear();
+    state.base_lm_step_graph_position = -1;
+    state.residual_lm_step_graph_position = -1;
 }
 
 }  // namespace
@@ -693,6 +720,12 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         fail("retry_badcase_ratio_threshold must be > 0");
     }
 
+    // Request boundary reset: cached runtime graphs and backend graph bookkeeping
+    // are rebuilt per synthesis request so reused service instances do not carry
+    // stale graph state across calls.
+    runtime_.reset_request_state();
+    backend_->reset_request_state();
+
     const bool has_prompt_audio = request.prompt.prompt_audio_length > 0;
     const bool has_reference_audio = request.prompt.reference_audio_length > 0;
     std::string effective_text = request.text;
@@ -710,6 +743,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
     }
     const PreparedConditioning prepared =
         build_conditioning(*split_tokenizer_, effective_text, request.prompt, patch_size_value, feat_dim_value);
+    const int seq_len = static_cast<int>(prepared.full_text_tokens.size());
     std::cerr << "[tts] synth start seq_len=" << prepared.full_text_tokens.size()
               << " prompt_audio_length=" << request.prompt.prompt_audio_length
               << " reference_audio_length=" << request.prompt.reference_audio_length
@@ -718,13 +752,14 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
     const int prompt_audio_length = request.prompt.prompt_audio_length;
     const int target_text_token_count =
         std::max<int>(1, static_cast<int>(split_tokenizer_->tokenize(effective_text).size()));
-    const int max_len =
-        std::min(static_cast<int>(target_text_token_count * request.retry_badcase_ratio_threshold + 10.0f), 2000);
+    const int hard_max_len = decode_step_cap_for_service(backend_type_, seq_len);
+    const int max_len = std::min({static_cast<int>(target_text_token_count * request.retry_badcase_ratio_threshold + 10.0f),
+                                  hard_max_len,
+                                  2000});
     constexpr int kMinLen = 2;
     const int max_attempts = retry_badcase ? std::max(1, request.retry_badcase_max_times) : 1;
 
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        const int seq_len = static_cast<int>(prepared.full_text_tokens.size());
         VoxCPMDecodeState state = runtime_.prefill(prepared.full_text_tokens,
                                                    prepared.text_mask,
                                                    prepared.feat,
@@ -732,8 +767,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                                    seq_len,
                                                    request.streaming_prefix_len);
         std::cerr << "[tts] prefill done seq_len=" << seq_len << " attempt=" << (attempt + 1) << "\n";
-        const bool use_output_pool_timeline =
-            state.output_pool != nullptr && state.output_pool->is_initialized() && !has_reference_audio;
+        const bool use_output_pool_timeline = should_use_output_pool_timeline(state, has_reference_audio, seq_len);
 
         std::mt19937 rng(std::random_device{}());
         std::vector<float> generated_steps;
@@ -794,6 +828,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                             chunk_waveform.erase(chunk_waveform.begin(),
                                                  chunk_waveform.end() - static_cast<std::ptrdiff_t>(patch_len));
                         }
+                        clear_decode_graph_caches_after_streaming_audio_decode(runtime_, state);
                         request.chunk_callback(chunk_waveform);
                     }
                 } else {
@@ -813,6 +848,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                             chunk_waveform.erase(chunk_waveform.begin(),
                                                  chunk_waveform.end() - static_cast<std::ptrdiff_t>(patch_len));
                         }
+                        clear_decode_graph_caches_after_streaming_audio_decode(runtime_, state);
                         request.chunk_callback(chunk_waveform);
                     }
                 }

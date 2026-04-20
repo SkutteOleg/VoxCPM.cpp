@@ -526,6 +526,7 @@ enum class BufferUsage {
 - `2026-04-07`: 已修复 `decode()` 主链里 `front_half.output_aux0` 被后续 cached graph 复用 compute arena 覆盖的问题；真实 CLI decode 单步诊断现已通过，`VoxCPM2` smoke 也从跑满 `max_len=190` 收敛到在 step `74` 触发 stop、输出约 `12.000s` 音频。
 - `2026-04-07`: 已为 `AudioVAE` 接上 `VoxCPM2` decoder-side `sr_cond_model`（含 `sr_bin_boundaries` bucket 语义、GGUF 权重加载与 decode 输入 staging）；新增 `test_audio_vae` 专项回归锁定该桥接，真实 `VoxCPM2` smoke 进一步从 step `74` 收敛到 step `24`，输出约 `4.000s / 48kHz` 音频。后续仍需继续与上游 PyTorch 做同 latent / 同 prompt 的波形级对拍，确认“已从乱码恢复”为真正数值对齐而非仅 stop 改善。
 - `2026-04-07`: 已补 `VoxCPM2 reference + prompt` 接口层：CLI/service 支持 `reference_wav_path` 等价装配、`retry_badcase` 参数、reference 特征持久化，并把 runtime prefill 的 prompt timeline 从“所有音频 span”收敛到“序列尾部 continuation 音频 span”；同时补上参考音频的首尾静音裁剪与区分 `reference/prompt` 编码日志。当前 reference/HiFi smoke 仍在 step `143` 左右停下、输出约 `23s`，说明 reference 模式的核心数值对齐尚未完成，下一步需要继续对拍上游 `prompt_cache/ref_continuation` 的 hidden/stop 语义。
+- `2026-04-18`: service 长文本请求已补 seq-aware graph context 与 chunked prefill fallback；CUDA service decode budget 固定为 `<=256/128 step`, `257-512/96 step`, `>512/64 step`，并在 `README.cuda.md` 记录。
 - `2026-04-03`: eager `prefill` 的 `residual_hidden` 已改成先 direct publish 到 `persistent_state`、再按需回填 host shadow；现有 eager/lazy transfer 测试已更新为锁定两条路径的 `h2d` 完全收敛，只剩 eager 为 host shadow 多付出的 `d2h`。
 - `2026-04-03`: eager `prefill` 的 `lm_hidden` 已改成 direct publish base last hidden 到 `persistent_state`、再按需回填 host shadow；现有 eager/lazy transfer 测试已进一步更新为锁定 eager 相对 lazy 的额外 `d2h` 至少覆盖 `lm_hidden + residual_hidden`。
 - `2026-04-03`: `prefill` 已把 `combined_embed` 从真实主链里收成 backend-resident 中转，避免先 `d2h` 到 host 再 `h2d` 回 `base_lm` 后半段；新增专门 transfer/regression 测试验证这一步至少减少一整块 `combined_embed` 级别的 `d2h + h2d`。
@@ -546,6 +547,8 @@ enum class BufferUsage {
 - `2026-04-03`: `benchmark_clone_state()` 已不再根据 host completeness 选择预热 host shadow 的创建路径；完整 host shadow clone 现在统一从空 fresh state 按需拷贝，新增测试锁定完整 host shadow 仍可正确保留。
 - `2026-04-02`: `decode` 当前 patch 追加到 `latent_seq` 已切到 d2d 路径，去掉了这一段 `tensor_get -> host vector -> tensor_set` 的回写链。
 - `2026-04-02`: `decode` 在 persistent path 下已不再分配无效 host hidden 向量，也不再写回会立刻被清空或覆盖的 `prefix_feat_cond` host shadow。
+- `2026-04-17`: OpenAI-compatible TTS server 已完成 `response_format=mp3/opus` 的实际编码与 SSE `audio.delta` 同格式输出；同时在 `/v1/audio/speech` 请求边界加入 runtime/backend reset，修复同一 core/service 的重复请求 `SEGV`，相关 README / CMake / tests / smoke 已收口。
+- `2026-04-20`: 流式 synth 的 chunk AudioVAE decode 现在会在继续下一步 decode 前清理 runtime/state cached graph handles，避免 compute arena 扩容后复用悬挂 tensor data；ASan 复现用例、CUDA service 集成测试与非 CLI runtime skeleton 已验证通过。
 
 ## 11. 参考文档
 
