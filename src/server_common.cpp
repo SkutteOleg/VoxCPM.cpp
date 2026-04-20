@@ -373,7 +373,7 @@ int chunked_audio_decode_patch_threshold(const AudioVAE& audio_vae) {
 }
 
 int chunked_audio_decode_max_window_patches(const AudioVAE& audio_vae) {
-    constexpr int kDefaultMaxWindowPatches = 1536;
+    constexpr int kDefaultMaxWindowPatches = 1024;
     constexpr int kConditionedMaxWindowPatches = 1024;
     const bool has_sr_conditioning = std::any_of(audio_vae.weights().decoder_blocks.begin(),
                                                  audio_vae.weights().decoder_blocks.end(),
@@ -388,7 +388,7 @@ int chunked_audio_decode_max_window_patches(const AudioVAE& audio_vae) {
 
 int chunked_audio_decode_history_frames(const AudioVAE& audio_vae, int patch_size) {
     constexpr int kDefaultChunkHistoryFrames = 64;
-    constexpr int kConditionedChunkHistoryFrames = 192;
+    constexpr int kConditionedChunkHistoryFrames = 128;
     const bool has_sr_conditioning = std::any_of(audio_vae.weights().decoder_blocks.begin(),
                                                  audio_vae.weights().decoder_blocks.end(),
                                                  [](const DecoderBlockWeights& block) {
@@ -409,10 +409,14 @@ int chunked_audio_decode_history_frames(const AudioVAE& audio_vae, int patch_siz
 int chunked_audio_decode_chunk_frames(const AudioVAE& audio_vae,
                                       int patch_size,
                                       int history_frames) {
-    const int requested_chunk_frames = env_int_or_default("VOXCPM_AUDIO_DECODE_CHUNK_FRAMES", 64);
     const int max_window_frames =
         std::max(1, chunked_audio_decode_max_window_patches(audio_vae) / std::max(1, patch_size));
-    return std::min(requested_chunk_frames, std::max(1, max_window_frames - history_frames));
+    const int safe_chunk_frames = std::max(1, max_window_frames - history_frames);
+    const int requested_chunk_frames = env_int_or_default("VOXCPM_AUDIO_DECODE_CHUNK_FRAMES", 0);
+    if (requested_chunk_frames > 0) {
+        return std::min(requested_chunk_frames, safe_chunk_frames);
+    }
+    return safe_chunk_frames;
 }
 
 bool should_use_chunked_audio_decode(const VoxCPMBackend& backend,
