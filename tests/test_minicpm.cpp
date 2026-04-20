@@ -757,6 +757,36 @@ void run_forward_step_trace_validation(const std::string& model_prefix,
                             label + " full value cache");
 }
 
+void require_attention_projection_contract(const MiniCPMModel& model) {
+    REQUIRE(!model.weights().layers.empty());
+    REQUIRE(model.config().n_layer == static_cast<int>(model.weights().layers.size()));
+    REQUIRE(model.config().hidden_size > 0);
+    REQUIRE(model.config().n_heads > 0);
+    REQUIRE(model.config().n_kv_heads > 0);
+    REQUIRE(model.config().head_dim() > 0);
+
+    const MiniCPMLayerWeights& layer = model.weights().layers.front();
+    REQUIRE(layer.input_layernorm != nullptr);
+    REQUIRE(layer.q_proj != nullptr);
+    REQUIRE(layer.k_proj != nullptr);
+    REQUIRE(layer.v_proj != nullptr);
+    REQUIRE(layer.o_proj != nullptr);
+
+    const int head_dim = model.config().head_dim();
+    const int q_rows = model.config().n_heads * head_dim;
+    const int kv_rows = model.config().n_kv_heads * head_dim;
+
+    REQUIRE(layer.input_layernorm->ne[0] == model.config().hidden_size);
+    REQUIRE(layer.q_proj->ne[0] == model.config().hidden_size);
+    REQUIRE(layer.k_proj->ne[0] == model.config().hidden_size);
+    REQUIRE(layer.v_proj->ne[0] == model.config().hidden_size);
+    REQUIRE(layer.q_proj->ne[1] == q_rows);
+    REQUIRE(layer.k_proj->ne[1] == kv_rows);
+    REQUIRE(layer.v_proj->ne[1] == kv_rows);
+    REQUIRE(layer.o_proj->ne[0] == q_rows);
+    REQUIRE(layer.o_proj->ne[1] == model.config().hidden_size);
+}
+
 }  // namespace
 
 TEST_CASE("MiniCPMConfig defaults", "[minicpm][config]") {
@@ -835,14 +865,15 @@ TEST_CASE("MiniCPM model loads BaseLM weights from GGUF", "[minicpm][integration
     MiniCPMModel model;
     REQUIRE(model.load_from_gguf(model_path, "", weight_ctx, graph_ctx, backend));
 
-    REQUIRE(model.config().n_layer == 24);
-    REQUIRE(model.config().hidden_size == 1024);
     REQUIRE(model.config().n_heads == 16);
     REQUIRE(model.config().n_kv_heads == 2);
+    REQUIRE(model.config().hidden_size > 0);
+    REQUIRE(model.config().n_layer > 0);
     REQUIRE(model.weights().embed_tokens != nullptr);
     REQUIRE(model.weights().norm != nullptr);
-    REQUIRE(model.weights().layers.size() == 24);
+    REQUIRE(model.weights().layers.size() == static_cast<size_t>(model.config().n_layer));
     REQUIRE(model.get_pos_tensor() != nullptr);
+    require_attention_projection_contract(model);
 }
 
 TEST_CASE("MiniCPM model loads variant-specific config from GGUF", "[minicpm][integration]") {
@@ -862,27 +893,30 @@ TEST_CASE("MiniCPM model loads variant-specific config from GGUF", "[minicpm][in
         MiniCPMModel residual;
         REQUIRE(residual.load_from_gguf(model_path, "residual_lm", weight_ctx, graph_ctx, backend));
         REQUIRE(residual.config().n_layer == 8);
-        REQUIRE(residual.config().hidden_size == 1024);
-        REQUIRE(residual.config().intermediate_size == 4096);
+        REQUIRE(residual.config().hidden_size > 0);
+        REQUIRE(residual.config().intermediate_size > 0);
         REQUIRE(residual.config().n_heads == 16);
+        require_attention_projection_contract(residual);
     }
 
     {
         MiniCPMModel locenc;
         REQUIRE(locenc.load_from_gguf(model_path, "locenc", weight_ctx, graph_ctx, backend));
-        REQUIRE(locenc.config().n_layer == 8);
+        REQUIRE(locenc.config().n_layer == static_cast<int>(locenc.weights().layers.size()));
         REQUIRE(locenc.config().hidden_size == 1024);
         REQUIRE(locenc.config().intermediate_size == 4096);
         REQUIRE(locenc.config().n_heads == 16);
+        require_attention_projection_contract(locenc);
     }
 
     {
         MiniCPMModel locdit;
         REQUIRE(locdit.load_from_gguf(model_path, "locdit", weight_ctx, graph_ctx, backend));
-        REQUIRE(locdit.config().n_layer == 8);
+        REQUIRE(locdit.config().n_layer == static_cast<int>(locdit.weights().layers.size()));
         REQUIRE(locdit.config().hidden_size == 1024);
         REQUIRE(locdit.config().intermediate_size == 4096);
         REQUIRE(locdit.config().n_heads == 16);
+        require_attention_projection_contract(locdit);
     }
 }
 

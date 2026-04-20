@@ -437,6 +437,7 @@ enum class BufferUsage {
 - [x] 已修复 `VoxCPMOutputPool::initialize()` 的 metadata context 估算，`voxcpm_tts` CLI 不再在 `create_decode_state()/prefill` 阶段因 patch views 撑爆 `ggml_context` 而崩溃；已用真实 `voxcpm_tts` 命令验证可完成整条推理并产出 wav
 - [x] `LocEnc patch` 已补 direct output-pool patch-view benchmark 路径与 h2d 收缩测试，阶段二开始覆盖 runtime-owned patch 输入边界
 - [x] `LocEnc patch -> lm embed` 已补 direct output-pool patch-view benchmark 路径与 h2d 收缩测试，阶段二开始覆盖 runtime-owned patch 输入边界
+- [x] 已修复长文本 LocEnc sequence graph 的 metadata context 估算与 VoxCPM2 原始 LocEnc hidden host 回读维度，避免 `ggml_context(no_alloc=true)` 在长 prompt 或 LocEnc/BaseLM hidden 不一致时崩溃
 - [x] 已补 `VoxCPM2` GGUF contract 兼容桥接：`kv_channels` 头维、`residual_lm_no_rope` 与 `AudioVAE out_sample_rate`
 - [x] 已补 `VoxCPM2` `fusion_concat_proj` 导出/加载与 runtime residual bridge 接口，`LocDiT` 也已支持多 `mu token` 前缀语义
 - [ ] `VoxCPM2` 真实 stop 数值对齐：当前已确认新 GGUF 可导出、可推理，但短句 smoke 仍会跑满 `max_len`，不能视为 stop 语义正确
@@ -527,6 +528,8 @@ enum class BufferUsage {
 - `2026-04-07`: 已为 `AudioVAE` 接上 `VoxCPM2` decoder-side `sr_cond_model`（含 `sr_bin_boundaries` bucket 语义、GGUF 权重加载与 decode 输入 staging）；新增 `test_audio_vae` 专项回归锁定该桥接，真实 `VoxCPM2` smoke 进一步从 step `74` 收敛到 step `24`，输出约 `4.000s / 48kHz` 音频。后续仍需继续与上游 PyTorch 做同 latent / 同 prompt 的波形级对拍，确认“已从乱码恢复”为真正数值对齐而非仅 stop 改善。
 - `2026-04-07`: 已补 `VoxCPM2 reference + prompt` 接口层：CLI/service 支持 `reference_wav_path` 等价装配、`retry_badcase` 参数、reference 特征持久化，并把 runtime prefill 的 prompt timeline 从“所有音频 span”收敛到“序列尾部 continuation 音频 span”；同时补上参考音频的首尾静音裁剪与区分 `reference/prompt` 编码日志。当前 reference/HiFi smoke 仍在 step `143` 左右停下、输出约 `23s`，说明 reference 模式的核心数值对齐尚未完成，下一步需要继续对拍上游 `prompt_cache/ref_continuation` 的 hidden/stop 语义。
 - `2026-04-19`: OpenAI-compatible `voxcpm-server` 已新增 `--output-sample-rate`，并把 `wav/mp3/opus/pcm` 的最终输出统一改为先按该采样率重采样后再编码；README / README.cuda / README_zh 已补充 24 kHz PCM 的服务端注意事项。
+- `2026-04-20`: 已把长文本 sequence graph 的 `ggml_context(no_alloc=true)` metadata headroom 改为随 `seq_len` 增长，并修复 VoxCPM2 中原始 `LocEnc` hidden 按 `BaseLM` hidden 回读的问题；`MiniCPM` integration 测试新增 attention 投影 shape 契约，锁定 `kv_channels=128` 不再退回 reshape 断言。
+- `2026-04-20`: GPU 最终 `AudioVAE decode` 的 chunk fallback 已改为按 `AudioVAE` 配置触发；对带 `sr_cond` / 更深 decoder 的 VoxCPM2 提前切到 chunk decode，避免在约 `1688` latent patches 时继续走整图解码而撞上 `ggml-cuda cpy` 的 transpose grid 断言。
 - `2026-04-18`: service 长文本请求已补 seq-aware graph context 与 chunked prefill fallback；CUDA service decode budget 固定为 `<=256/128 step`, `257-512/96 step`, `>512/64 step`，并在 `README.cuda.md` 记录。
 - `2026-04-03`: eager `prefill` 的 `residual_hidden` 已改成先 direct publish 到 `persistent_state`、再按需回填 host shadow；现有 eager/lazy transfer 测试已更新为锁定两条路径的 `h2d` 完全收敛，只剩 eager 为 host shadow 多付出的 `d2h`。
 - `2026-04-03`: eager `prefill` 的 `lm_hidden` 已改成 direct publish base last hidden 到 `persistent_state`、再按需回填 host shadow；现有 eager/lazy transfer 测试已进一步更新为锁定 eager 相对 lazy 的额外 `d2h` 至少覆盖 `lm_hidden + residual_hidden`。

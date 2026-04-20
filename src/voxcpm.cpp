@@ -24,13 +24,18 @@ VoxCPMContext make_graph_ctx(int n_tensors, int max_nodes) {
 }
 
 VoxCPMContext make_sequence_graph_ctx(int seq_len, int min_tensors, int min_nodes) {
-    constexpr size_t kSequenceGraphHeadroomBytes = 16 * 1024 * 1024;
     const int safe_seq_len = std::max(0, seq_len);
-    // Seq-dependent graphs can land slightly short when ggml expands internal
-    // bookkeeping for attention/rope-heavy paths, so keep a fixed cushion.
+    constexpr size_t kSequenceGraphBaseHeadroomBytes = 32 * 1024 * 1024;
+    constexpr size_t kSequenceGraphPerTokenHeadroomBytes = 32 * 1024;
+    const size_t headroom_bytes =
+        kSequenceGraphBaseHeadroomBytes +
+        static_cast<size_t>(safe_seq_len) * kSequenceGraphPerTokenHeadroomBytes;
+
+    // Sequence graphs unroll LocEnc patch work per token. Keep metadata headroom
+    // tied to seq_len so long prompts do not exhaust ggml's no_alloc context.
     const int n_tensors = min_tensors + safe_seq_len * 64 + 1024;
     const int max_nodes = min_nodes + safe_seq_len * 256 + 8192;
-    return VoxCPMContext(ContextType::Graph, n_tensors, max_nodes, kSequenceGraphHeadroomBytes);
+    return VoxCPMContext(ContextType::Graph, n_tensors, max_nodes, headroom_bytes);
 }
 
 std::string decode_graph_key(int n_timesteps, float cfg_value) {
@@ -530,7 +535,8 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_locenc_sequence_to_lm_projection_graph(
     }
 
     cached.clear();
-    cached.context = std::make_unique<VoxCPMContext>(ContextType::Graph, 65536, 524288);
+    cached.context = std::make_unique<VoxCPMContext>(
+        make_sequence_graph_ctx(seq_len, 65536, 524288));
     VoxCPMContext& graph_ctx = *cached.context;
     cached.input0 = graph_ctx.new_tensor_3d(GGML_TYPE_F32, config_.feat_dim, config_.patch_size, seq_len);
     ggml_set_input(cached.input0);
@@ -556,7 +562,8 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_embedding_masked_locenc_sequence_to_lm_
     }
 
     cached.clear();
-    cached.context = std::make_unique<VoxCPMContext>(ContextType::Graph, 65536, 524288);
+    cached.context = std::make_unique<VoxCPMContext>(
+        make_sequence_graph_ctx(seq_len, 65536, 524288));
     VoxCPMContext& graph_ctx = *cached.context;
     ggml_context* raw = graph_ctx.raw_context();
 
@@ -602,7 +609,8 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_enc_to_lm_projection_graph(int seq_len)
     }
 
     cached.clear();
-    cached.context = std::make_unique<VoxCPMContext>(ContextType::Graph, 65536, 524288);
+    cached.context = std::make_unique<VoxCPMContext>(
+        make_sequence_graph_ctx(seq_len, 8192, 65536));
     VoxCPMContext& graph_ctx = *cached.context;
     cached.input0 = graph_ctx.new_tensor_2d(GGML_TYPE_F32, feat_encoder_.config().hidden_size, seq_len);
     ggml_set_input(cached.input0);
@@ -665,7 +673,8 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_locenc_sequence_to_lm_projection_fsq_gr
     }
 
     cached.clear();
-    cached.context = std::make_unique<VoxCPMContext>(ContextType::Graph, 65536, 524288);
+    cached.context = std::make_unique<VoxCPMContext>(
+        make_sequence_graph_ctx(seq_len, 65536, 524288));
     VoxCPMContext& graph_ctx = *cached.context;
     cached.input0 = graph_ctx.new_tensor_3d(GGML_TYPE_F32, config_.feat_dim, config_.patch_size, seq_len);
     ggml_set_input(cached.input0);
@@ -1003,11 +1012,11 @@ void VoxCPMRuntime::run_locenc_patch_into(const float* patch_data, float* output
     backend_->tensor_get(cached.output,
                          output_data,
                          0,
-                         static_cast<size_t>(base_lm_.config().hidden_size) * sizeof(float));
+                         static_cast<size_t>(feat_encoder_.config().hidden_size) * sizeof(float));
 }
 
 std::vector<float> VoxCPMRuntime::run_locenc_patch(const float* patch_data) {
-    std::vector<float> out(static_cast<size_t>(base_lm_.config().hidden_size));
+    std::vector<float> out(static_cast<size_t>(feat_encoder_.config().hidden_size));
     run_locenc_patch_into(patch_data, out.data());
     return out;
 }
@@ -1023,7 +1032,7 @@ std::vector<float> VoxCPMRuntime::run_locenc_patch_from_tensor(ggml_tensor* patc
     VOXCPM_ASSERT(backend_->compute(cached.graph) == GGML_STATUS_SUCCESS);
     maybe_collect_graph(cached.graph);
 
-    std::vector<float> out(static_cast<size_t>(base_lm_.config().hidden_size));
+    std::vector<float> out(static_cast<size_t>(feat_encoder_.config().hidden_size));
     backend_->tensor_get(cached.output, out.data(), 0, out.size() * sizeof(float));
     return out;
 }
@@ -1038,7 +1047,7 @@ std::vector<float> VoxCPMRuntime::encode_feature_sequence(const std::vector<floa
     VOXCPM_ASSERT(backend_->compute(cached.graph) == GGML_STATUS_SUCCESS);
     maybe_collect_graph(cached.graph);
 
-    std::vector<float> encoded(static_cast<size_t>(base_lm_.config().hidden_size) * seq_len);
+    std::vector<float> encoded(static_cast<size_t>(feat_encoder_.config().hidden_size) * seq_len);
     backend_->tensor_get(cached.output, encoded.data(), 0, encoded.size() * sizeof(float));
     return encoded;
 }
