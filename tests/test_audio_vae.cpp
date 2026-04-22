@@ -30,6 +30,7 @@ const std::string kModelPath = get_model_path();
 const std::string kTraceEncodePath = get_trace_path("trace_AudioVAE_encode.jsonl");
 const std::string kTraceDecodePath = get_trace_path("trace_AudioVAE_decode.jsonl");
 const std::string kVoxCPM2ModelPath = "/root/code/VoxCPM.cpp/models/voxcpm2.gguf";
+const std::string kVoxCPM2QuantizedModelPath = "/root/code/VoxCPM.cpp/models/quantized/voxcpm2-q8_0.gguf";
 constexpr float kTargetMaxDiff = 2e-4f;
 constexpr float kCudaSmokeMaxDiff = 1e-1f;
 
@@ -167,6 +168,15 @@ TEST_CASE("AudioVAEConfig output sample rate falls back to input sample rate", "
 
     config.out_sample_rate = 48000;
     REQUIRE(config.output_sample_rate() == 48000);
+}
+
+TEST_CASE("AudioVAEConfig keeps encoder and decoder hop lengths separate", "[audio_vae][config]") {
+    AudioVAEConfig config;
+    config.encoder_rates = {2, 5, 8, 8};
+    config.decoder_rates = {8, 6, 5, 2, 2, 2};
+
+    REQUIRE(config.hop_length() == 640);
+    REQUIRE(config.decode_hop_length() == 1920);
 }
 
 void print_error_stats(const char* label,
@@ -514,6 +524,168 @@ TEST_CASE("AudioVAE decode CUDA smoke", "[audio_vae][decode][cuda][smoke]") {
     print_error_stats("AudioVAE decode CUDA output", latent_input, expected, actual, stats, kCudaSmokeMaxDiff);
     print_graph_timing("AudioVAE decode CUDA", timing);
     INFO("decode CUDA max_abs_diff = " << stats.max_abs_diff);
+    REQUIRE(stats.max_abs_diff <= kCudaSmokeMaxDiff);
+}
+
+TEST_CASE("AudioVAE stateful streaming decode CUDA matches trace", "[audio_vae][decode][cuda][streaming]") {
+    if (!file_exists(kModelPath) || !file_exists(kTraceDecodePath)) {
+        WARN("Decode test dependencies missing, skipping test");
+        return;
+    }
+
+    auto backend = try_create_cuda_backend();
+    if (!backend) {
+        return;
+    }
+
+    const json trace = load_jsonl_line(kTraceDecodePath, 0);
+    const std::vector<float> latent_input = flatten_bct_to_tc(trace.at("inputs").at("z"));
+    const std::vector<float> expected = flatten_bct_to_tc(trace.at("outputs").at("output"));
+
+    VoxCPMContext weight_ctx(ContextType::Weights, 512);
+    VoxCPMContext graph_ctx(ContextType::Graph, 65536, 262144);
+
+    AudioVAE vae;
+    REQUIRE(vae.load_from_gguf(kModelPath, weight_ctx, graph_ctx, *backend));
+    REQUIRE(vae.supports_streaming_decode(*backend));
+
+    AudioVAEStreamingDecodeState stream_state;
+    REQUIRE(vae.initialize_streaming_decode_state(*backend, stream_state));
+    REQUIRE(stream_state.slot_count() > 0);
+
+    constexpr int kTotalPatches = 36;
+    constexpr int kChunkPatches = 9;
+    constexpr int kLatentDim = 64;
+    std::vector<float> streamed;
+    streamed.reserve(expected.size());
+
+    for (int patch_offset = 0; patch_offset < kTotalPatches; patch_offset += kChunkPatches) {
+        const int chunk_patches = std::min(kChunkPatches, kTotalPatches - patch_offset);
+        std::vector<float> chunk(static_cast<size_t>(chunk_patches) * kLatentDim, 0.0f);
+        for (int d = 0; d < kLatentDim; ++d) {
+            for (int t = 0; t < chunk_patches; ++t) {
+                chunk[static_cast<size_t>(d) * chunk_patches + t] =
+                    latent_input[static_cast<size_t>(d) * kTotalPatches + patch_offset + t];
+            }
+        }
+
+        VoxCPMContext chunk_ctx(ContextType::Graph, 65536, 262144);
+        ggml_tensor* latent = chunk_ctx.new_tensor_3d(GGML_TYPE_F32, chunk_patches, kLatentDim, 1);
+        REQUIRE(latent != nullptr);
+        ggml_set_input(latent);
+        ggml_tensor* audio = vae.decode_streaming(chunk_ctx, *backend, latent, stream_state);
+        REQUIRE(audio != nullptr);
+
+        ggml_cgraph* graph = chunk_ctx.new_graph();
+        REQUIRE(graph != nullptr);
+        chunk_ctx.build_forward(graph, audio);
+        stream_state.build_update_graph(graph);
+        backend->alloc_graph(graph);
+        backend->tensor_set(latent, chunk.data(), 0, chunk.size() * sizeof(float));
+        vae.prepare_decode_inputs(*backend);
+        REQUIRE(backend->compute(graph) == GGML_STATUS_SUCCESS);
+        stream_state.publish_updates(*backend);
+
+        std::vector<float> chunk_audio(static_cast<size_t>(ggml_nelements(audio)), 0.0f);
+        backend->tensor_get(audio, chunk_audio.data(), 0, chunk_audio.size() * sizeof(float));
+        streamed.insert(streamed.end(), chunk_audio.begin(), chunk_audio.end());
+    }
+
+    REQUIRE(streamed.size() == expected.size());
+    REQUIRE(all_finite(streamed));
+
+    const ErrorStats stats = compute_error_stats(streamed, expected);
+    print_error_stats("AudioVAE stateful streaming decode CUDA output", latent_input, expected, streamed, stats, kCudaSmokeMaxDiff);
+    INFO("stateful streaming decode CUDA max_abs_diff = " << stats.max_abs_diff);
+    REQUIRE(stats.max_abs_diff <= kCudaSmokeMaxDiff);
+}
+
+TEST_CASE("AudioVAE stateful streaming decode CUDA matches full decode", "[audio_vae][decode][cuda][streaming][voxcpm2]") {
+    if (!file_exists(kVoxCPM2QuantizedModelPath)) {
+        WARN("VoxCPM2 quantized GGUF not found, skipping test");
+        return;
+    }
+
+    auto backend = try_create_cuda_backend();
+    if (!backend) {
+        return;
+    }
+
+    VoxCPMContext weight_ctx(ContextType::Weights, 512);
+    VoxCPMContext graph_ctx(ContextType::Graph, 65536, 262144);
+
+    AudioVAE vae;
+    REQUIRE(vae.load_from_gguf(kVoxCPM2QuantizedModelPath, weight_ctx, graph_ctx, *backend));
+    REQUIRE(vae.supports_streaming_decode(*backend));
+
+    const int total_patches = 32;
+    const int latent_dim = vae.config().latent_dim;
+    std::vector<float> latent_input(static_cast<size_t>(total_patches) * latent_dim, 0.0f);
+    for (int d = 0; d < latent_dim; ++d) {
+        for (int t = 0; t < total_patches; ++t) {
+            latent_input[static_cast<size_t>(d) * total_patches + t] =
+                0.1f * std::sin(static_cast<float>(d * 17 + t * 31) * 0.013f);
+        }
+    }
+
+    ggml_tensor* full_latent = graph_ctx.new_tensor_3d(GGML_TYPE_F32, total_patches, latent_dim, 1);
+    REQUIRE(full_latent != nullptr);
+    ggml_set_input(full_latent);
+    ggml_tensor* full_audio = vae.decode(graph_ctx, *backend, full_latent);
+    REQUIRE(full_audio != nullptr);
+
+    run_graph_with_timing(graph_ctx, *backend, full_audio, [&]() {
+        backend->tensor_set(full_latent, latent_input.data(), 0, latent_input.size() * sizeof(float));
+        vae.prepare_decode_inputs(*backend);
+    });
+
+    std::vector<float> expected(static_cast<size_t>(ggml_nelements(full_audio)), 0.0f);
+    backend->tensor_get(full_audio, expected.data(), 0, expected.size() * sizeof(float));
+
+    AudioVAEStreamingDecodeState stream_state;
+    REQUIRE(vae.initialize_streaming_decode_state(*backend, stream_state));
+
+    constexpr int kChunkPatches = 8;
+    std::vector<float> streamed;
+    streamed.reserve(expected.size());
+    for (int patch_offset = 0; patch_offset < total_patches; patch_offset += kChunkPatches) {
+        const int chunk_patches = std::min(kChunkPatches, total_patches - patch_offset);
+        std::vector<float> chunk(static_cast<size_t>(chunk_patches) * latent_dim, 0.0f);
+        for (int d = 0; d < latent_dim; ++d) {
+            for (int t = 0; t < chunk_patches; ++t) {
+                chunk[static_cast<size_t>(d) * chunk_patches + t] =
+                    latent_input[static_cast<size_t>(d) * total_patches + patch_offset + t];
+            }
+        }
+
+        VoxCPMContext chunk_ctx(ContextType::Graph, 65536, 262144);
+        ggml_tensor* latent = chunk_ctx.new_tensor_3d(GGML_TYPE_F32, chunk_patches, latent_dim, 1);
+        REQUIRE(latent != nullptr);
+        ggml_set_input(latent);
+        ggml_tensor* audio = vae.decode_streaming(chunk_ctx, *backend, latent, stream_state);
+        REQUIRE(audio != nullptr);
+
+        ggml_cgraph* graph = chunk_ctx.new_graph();
+        REQUIRE(graph != nullptr);
+        chunk_ctx.build_forward(graph, audio);
+        stream_state.build_update_graph(graph);
+        backend->alloc_graph(graph);
+        backend->tensor_set(latent, chunk.data(), 0, chunk.size() * sizeof(float));
+        vae.prepare_decode_inputs(*backend);
+        REQUIRE(backend->compute(graph) == GGML_STATUS_SUCCESS);
+        stream_state.publish_updates(*backend);
+
+        std::vector<float> chunk_audio(static_cast<size_t>(ggml_nelements(audio)), 0.0f);
+        backend->tensor_get(audio, chunk_audio.data(), 0, chunk_audio.size() * sizeof(float));
+        streamed.insert(streamed.end(), chunk_audio.begin(), chunk_audio.end());
+    }
+
+    REQUIRE(streamed.size() == expected.size());
+    REQUIRE(all_finite(streamed));
+
+    const ErrorStats stats = compute_error_stats(streamed, expected);
+    print_error_stats("AudioVAE stateful streaming decode CUDA vs full decode", latent_input, expected, streamed, stats, kCudaSmokeMaxDiff);
+    INFO("stateful streaming vs full decode CUDA max_abs_diff = " << stats.max_abs_diff);
     REQUIRE(stats.max_abs_diff <= kCudaSmokeMaxDiff);
 }
 

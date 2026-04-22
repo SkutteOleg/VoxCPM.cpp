@@ -69,6 +69,16 @@ struct AudioVAEConfig {
     }
 
     /**
+     * @brief Get decoder output step length (total upsampling factor)
+     * decode_hop_length = product of all decoder_rates
+     */
+    int decode_hop_length() const {
+        int hop = 1;
+        for (int r : decoder_rates) hop *= r;
+        return hop;
+    }
+
+    /**
      * @brief Get number of encoder blocks
      */
     int num_encoder_blocks() const { return static_cast<int>(encoder_rates.size()); }
